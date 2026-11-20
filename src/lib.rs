@@ -96,6 +96,14 @@ const DOTENV_DENIED_BARE: &[&str] = &[
     "SSL_CERT_DIR",
     "CURL_CA_BUNDLE",
     "REQUESTS_CA_BUNDLE",
+    // Decide where settings and stored credentials are read from. A `.env`
+    // that moved them into the repository could plant a config naming a
+    // program to execute (e.g. `say`'s audio player). Windows shells leave
+    // `HOME` unset, so the `.env` value would otherwise take effect.
+    "HOME",
+    "USERPROFILE",
+    "APPDATA",
+    "XDG_CONFIG_HOME",
 ];
 
 /// Suffixes of `<PREFIX>_…` env vars a `.env` file may not set. Same
@@ -176,8 +184,8 @@ pub fn warn_ignored_dotenv_keys(ignored: &[String]) {
     for key in ignored {
         tracing::warn!(
             key = %key,
-            "ignoring {key} from .env: it controls transport or process execution, and a \
-             .env file is not a trusted source for it. Export it from your shell instead."
+            "ignoring {key} from .env: it controls transport, process execution or where \
+             settings are read from, and a .env file is not a trusted source for it. Export it from your shell instead."
         );
     }
 }
@@ -238,6 +246,12 @@ mod dotenv_filter_tests {
             "elevenlabs_base_url",
             "Elevenlabs_Insecure",
             "browser",
+            "HOME",
+            "USERPROFILE",
+            "APPDATA",
+            "XDG_CONFIG_HOME",
+            "home",
+            "UserProfile",
         ] {
             assert!(
                 dotenv_key_is_denied(key, "ELEVENLABS"),

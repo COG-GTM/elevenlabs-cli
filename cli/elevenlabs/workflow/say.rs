@@ -92,6 +92,25 @@ fn read_configured(json_key: &str) -> Option<String> {
     settings::read_setting(&[SECTION, json_key]).filter(|v| !v.trim().is_empty())
 }
 
+/// The stored player, checked the same way `say config player` checks it
+/// before writing. The file can be edited by hand (or planted), and its value
+/// is executed, so it gets no more trust than the command line.
+fn configured_player() -> Result<Option<String>, CliError> {
+    let Some(value) = read_configured("player") else {
+        return Ok(None);
+    };
+    let spec = spec_for("player").expect("player is a setting");
+    validate_value(spec, &value).map_err(|e| {
+        CliError::Validation(format!(
+            "The stored audio player is not usable: {}. Fix it with \
+             'elevenlabs say config player <command>' or clear it with \
+             'elevenlabs say config player --unset'.",
+            e.to_string().trim_end_matches('.')
+        ))
+    })?;
+    Ok(Some(value))
+}
+
 /// Flag > config file > built-in default. A whitespace-only value counts as
 /// unset at every layer — the same trap `residency::base_url_to_export`
 /// guards, since an empty voice ID would build a URL like `/v1/…//stream`.
@@ -570,7 +589,6 @@ fn handle_say(args: SayArgs, ctx: &AppContext) -> Result<(), CliError> {
     let configured_voice = read_configured("voice_id");
     let configured_model = read_configured("model_id");
     let configured_format = read_configured("output_format");
-    let configured_player = read_configured("player");
 
     let voice_id = resolve(
         args.voice.as_deref(),
@@ -587,12 +605,10 @@ fn handle_say(args: SayArgs, ctx: &AppContext) -> Result<(), CliError> {
 
     // Resolve the player before generating anything: "no player installed"
     // should not cost an API call. Skipped entirely for --output.
-    let player = match args.output {
-        Some(_) => None,
-        None => Some(resolve_player(
-            args.player.as_deref(),
-            configured_player.as_deref(),
-        )?),
+    let player = match (&args.output, args.player.as_deref()) {
+        (Some(_), _) => None,
+        (None, Some(explicit)) => Some(resolve_player(Some(explicit), None)?),
+        (None, None) => Some(resolve_player(None, configured_player()?.as_deref())?),
     };
 
     let output_format = output_format_for(
@@ -739,11 +755,32 @@ fn validate_value(spec: &SettingSpec, value: &str) -> Result<(), CliError> {
             }
         }
     }
+    if spec.cli_key == "player" && is_relative_path(value.trim()) {
+        return Err(CliError::Validation(format!(
+            "Invalid player '{value}': a relative path would resolve against \
+             whatever directory 'say' runs in. Use a command name on PATH or \
+             an absolute path."
+        )));
+    }
     Ok(())
+}
+
+/// A path with a separator that is not absolute, like `./tools/play`.
+fn is_relative_path(program: &str) -> bool {
+    let has_separator = program.contains('/') || (cfg!(windows) && program.contains('\\'));
+    has_separator && !Path::new(program).is_absolute()
 }
 
 /// How a value is being sourced, for the `say config` listing.
 fn describe(spec: &SettingSpec) -> String {
+    if spec.cli_key == "player" {
+        if let Err(e) = configured_player() {
+            return format!(
+                "{} ({e})",
+                read_configured(spec.json_key).unwrap_or_default()
+            );
+        }
+    }
     match (read_configured(spec.json_key), spec.default) {
         (Some(v), _) => v,
         (None, Some(d)) => format!("{d} (default)"),
@@ -1020,6 +1057,25 @@ mod tests {
     fn a_missing_player_is_never_silently_accepted() {
         let err = resolve_player(Some("definitely-not-a-real-player-xyz"), None).unwrap_err();
         assert!(matches!(err, CliError::Validation(_)));
+    }
+
+    #[test]
+    fn a_relative_player_path_is_rejected() {
+        let spec = spec_for("player").unwrap();
+        for value in ["./tools/play", "tools/play", "../play", " ./play "] {
+            assert!(
+                matches!(validate_value(spec, value), Err(CliError::Validation(_))),
+                "{value} must be rejected"
+            );
+        }
+        for value in ["mpv", "ffplay", "/usr/bin/mpv"] {
+            assert!(
+                validate_value(spec, value).is_ok(),
+                "{value} must be accepted"
+            );
+        }
+        // Only the player is executed; a voice ID with a slash is the API's problem.
+        assert!(validate_value(spec_for("voice").unwrap(), "a/b").is_ok());
     }
 
     #[test]

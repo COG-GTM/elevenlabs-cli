@@ -271,3 +271,124 @@ async fn stored_defaults_drive_the_request() {
     assert_eq!(config["say"]["model_id"], "eleven_multilingual_v2");
     assert!(config["say"].get("voice_id").is_none());
 }
+
+/// Write `config.json` with `say.player` set, bypassing `say config`'s checks
+/// the way a hand edit or a planted file would.
+fn plant_player_config(home: &Path, player: &str) {
+    let dir = home.join(".elevenlabs");
+    std::fs::create_dir_all(&dir).expect("create config dir");
+    std::fs::write(
+        dir.join("config.json"),
+        serde_json::json!({ "say": { "player": player } }).to_string(),
+    )
+    .expect("write config");
+}
+
+/// A repository's `.env` must not be able to move `HOME` into the repository
+/// and plant a config whose player is a program shipped in that repository.
+/// Windows shells leave `HOME` unset, which is when `.env` used to win.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dotenv_home_cannot_choose_the_player() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v1/text-to-speech/{VOICE_ID}/stream")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(AUDIO))
+        .mount(&server)
+        .await;
+
+    let repo = tempfile::tempdir().expect("tempdir");
+    let marker = repo.path().join("played.marker");
+    std::fs::create_dir_all(repo.path().join("tools")).expect("mkdir tools");
+    let planted = fake_player(&repo.path().join("tools"), &marker);
+    std::fs::rename(&planted, repo.path().join("tools/play")).expect("rename player");
+    plant_player_config(repo.path(), "./tools/play");
+    std::fs::write(repo.path().join(".env"), "HOME=.\nUSERPROFILE=.\n").expect("write .env");
+    let empty_path = tempfile::tempdir().expect("tempdir");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_elevenlabs"))
+        .args(["say", "hello", "--base-url", &server.uri()])
+        .current_dir(repo.path())
+        .env_remove("HOME")
+        .env_remove("USERPROFILE")
+        .env_remove("APPDATA")
+        .env_remove("XDG_CONFIG_HOME")
+        // No real player either, so nothing can be auto-detected.
+        .env("PATH", empty_path.path())
+        .env("ELEVENLABS_API_KEY", "test-key")
+        .env("NO_COLOR", "1")
+        .env("FERN_CLI_CREDENTIAL_STORE", "file")
+        .env_remove("ELEVENLABS_BASE_URL")
+        .env_remove("ELEVENLABS_VIA")
+        .output()
+        .expect("failed to spawn the elevenlabs binary");
+
+    let reported = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !marker.exists(),
+        "the repository's player must not run: {reported}"
+    );
+    assert!(
+        !out.status.success(),
+        "no player should resolve: {reported}"
+    );
+    assert!(
+        reported.contains("No audio player found"),
+        "the planted config must not be read at all: {reported}"
+    );
+}
+
+/// A stored player is executed, so it is checked on read just as
+/// `say config player` checks it on write.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stored_relative_player_is_refused() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v1/text-to-speech/{VOICE_ID}/stream")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(AUDIO))
+        .mount(&server)
+        .await;
+
+    let home = tempfile::tempdir().expect("tempdir");
+    let marker = home.path().join("played.marker");
+    fake_player(home.path(), &marker);
+    plant_player_config(home.path(), "./fake-player");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_elevenlabs"))
+        .args(["say", "hello", "--base-url", &server.uri()])
+        .current_dir(home.path())
+        .env("HOME", home.path())
+        .env("ELEVENLABS_API_KEY", "test-key")
+        .env("NO_COLOR", "1")
+        .env("FERN_CLI_CREDENTIAL_STORE", "file")
+        .env_remove("ELEVENLABS_BASE_URL")
+        .env_remove("ELEVENLABS_VIA")
+        .output()
+        .expect("failed to spawn the elevenlabs binary");
+    let reported = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !marker.exists(),
+        "a relative stored player must not run: {reported}"
+    );
+    assert!(
+        reported.contains("stored audio player is not usable"),
+        "the user should be told why: {reported}"
+    );
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "a bad player should be caught before the API call"
+    );
+
+    // `say config` refuses to write one in the first place.
+    let out = cli(home.path(), &["say", "config", "player", "./fake-player"]);
+    assert!(!out.status.success());
+}
