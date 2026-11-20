@@ -249,6 +249,10 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
 /// - macOS: `~/Library/Application Support`
 /// - Windows: `%APPDATA%` (with `~/AppData/Roaming` fallback)
 /// - Linux/other: `$XDG_CONFIG_HOME` (with `~/.config` fallback)
+///
+/// A relative `APPDATA` / `XDG_CONFIG_HOME` is ignored, as the XDG spec
+/// requires: it would resolve against the working directory and put the
+/// credential file inside whatever project the CLI was run from.
 pub(crate) fn config_dir() -> Option<PathBuf> {
     let home = home_dir()?;
     #[cfg(target_os = "macos")]
@@ -259,12 +263,14 @@ pub(crate) fn config_dir() -> Option<PathBuf> {
     {
         std::env::var_os("APPDATA")
             .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
             .or(Some(home.join("AppData").join("Roaming")))
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
             .or(Some(home.join(".config")))
     }
 }
@@ -628,6 +634,37 @@ mod tests {
         let t = truncate_body(&s);
         assert!(t.len() < s.len());
         assert!(t.ends_with('…'));
+    }
+
+    /// A relative `XDG_CONFIG_HOME` (e.g. `.tools` from a project `.env`)
+    /// would resolve against the working directory and put the credential
+    /// file inside the project; it must fall back to `~/.config` instead.
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[test]
+    #[serial_test::serial]
+    fn config_dir_ignores_relative_xdg_config_home() {
+        let home = tempfile::tempdir().unwrap();
+        let xdg = tempfile::tempdir().unwrap();
+        let saved_home = std::env::var_os("HOME");
+        let saved_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("HOME", home.path());
+
+        std::env::set_var("XDG_CONFIG_HOME", ".tools");
+        let relative = config_dir();
+        std::env::set_var("XDG_CONFIG_HOME", "");
+        let empty = config_dir();
+        std::env::set_var("XDG_CONFIG_HOME", xdg.path());
+        let absolute = config_dir();
+
+        for (key, value) in [("HOME", saved_home), ("XDG_CONFIG_HOME", saved_xdg)] {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+        assert_eq!(relative, Some(home.path().join(".config")));
+        assert_eq!(empty, Some(home.path().join(".config")));
+        assert_eq!(absolute, Some(xdg.path().to_path_buf()));
     }
 
     #[test]
