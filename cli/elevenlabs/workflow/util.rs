@@ -50,6 +50,27 @@ pub fn plan_pull_action(exists_locally: bool, update: bool, all: bool) -> PullAc
     }
 }
 
+/// `text` without control characters (an escape sequence in a name read from
+/// a project file or the API could otherwise clear or rewrite the terminal)
+/// and without the invisible or reordering Unicode that could disguise what
+/// is printed: zero-width characters, bidi overrides and isolates, and line
+/// separators. Newlines and tabs become spaces, so a value stays on one line.
+/// The same policy as the CLI's own output sanitizer.
+pub fn terminal_safe(text: &str) -> String {
+    text.chars()
+        .filter_map(|c| match c {
+            '\n' | '\r' | '\t' => Some(' '),
+            c if c.is_control() => None,
+            '\u{200B}'..='\u{200D}'
+            | '\u{FEFF}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2028}'..='\u{2029}'
+            | '\u{2066}'..='\u{2069}' => None,
+            c => Some(c),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,6 +84,16 @@ mod tests {
             )
             .arg(clap::Arg::new("agent").long("agent"))
             .get_matches_from(args)
+    }
+
+    #[test]
+    fn terminal_safe_strips_escapes_and_invisible_unicode() {
+        assert_eq!(terminal_safe("\u{1b}[2Jx"), "[2Jx");
+        assert_eq!(terminal_safe("\u{1b}]0;title\u{7}ok"), "]0;titleok");
+        assert_eq!(terminal_safe("a\u{9b}31mb"), "a31mb");
+        assert_eq!(terminal_safe("ab\u{202E}cd\u{200B}"), "abcd");
+        assert_eq!(terminal_safe("one\ntwo\rthree\tfour"), "one two three four");
+        assert_eq!(terminal_safe("Plain name é"), "Plain name é");
     }
 
     #[test]

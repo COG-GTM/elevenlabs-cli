@@ -10,7 +10,9 @@ use fern_cli_sdk::error::CliError;
 use fern_cli_sdk::openapi::AppContext;
 use serde_json::{json, Value};
 
-use super::util::{downcast_ctx, dry_run_flag, opt_string, plan_pull_action, PullAction};
+use super::util::{
+    downcast_ctx, dry_run_flag, opt_string, plan_pull_action, terminal_safe, PullAction,
+};
 use super::{api, project};
 
 /// Register the `tests` command group.
@@ -231,12 +233,19 @@ fn register_discovered(registry: &mut project::TestsConfig, config_dir: &str) ->
         let config = match project::read_value(Path::new(&candidate)) {
             Ok(v) => v,
             Err(e) => {
-                println!("Warning: Skipping unreadable test config {candidate}: {e}");
+                println!(
+                    "Warning: Skipping unreadable test config {}: {}",
+                    terminal_safe(&candidate),
+                    terminal_safe(&e.to_string())
+                );
                 continue;
             }
         };
         if !looks_like_test_config(&config) {
-            println!("Warning: Skipping non-test JSON file {candidate}");
+            println!(
+                "Warning: Skipping non-test JSON file {}",
+                terminal_safe(&candidate)
+            );
             continue;
         }
         registry.tests.push(project::TestDefinition {
@@ -256,7 +265,7 @@ fn remove_config_file(config_path: &str) -> bool {
     match project::remove_in_project(config_path) {
         Ok(removed) => removed,
         Err(e) => {
-            eprintln!("  Warning: {e}");
+            eprintln!("  Warning: {}", terminal_safe(&e.to_string()));
             false
         }
     }
@@ -289,14 +298,18 @@ fn handle_add(args: AddArgs, ctx: &AppContext) -> Result<(), CliError> {
         registry
     };
 
-    println!("Creating test '{}' in ElevenLabs...", args.name);
+    let shown_name = terminal_safe(&args.name);
+    println!("Creating test '{shown_name}' in ElevenLabs...");
     let response = api::create_test(ctx, &config)?;
     let test_id = test_id_of(&response).ok_or_else(|| {
         CliError::Other(anyhow::anyhow!(
             "Test create response did not contain an id: {response}"
         ))
     })?;
-    println!("Created test in ElevenLabs with ID: {test_id}");
+    println!(
+        "Created test in ElevenLabs with ID: {}",
+        terminal_safe(&test_id)
+    );
 
     let config_path = match &args.config_path {
         Some(path) => path.clone(),
@@ -305,9 +318,10 @@ fn handle_add(args: AddArgs, ctx: &AppContext) -> Result<(), CliError> {
             .to_string(),
     };
     project::write_config_in_project(&config_path, &config)?;
+    let shown_path = terminal_safe(&config_path);
     println!(
-        "Created config file: {config_path} (template: {})",
-        args.template
+        "Created config file: {shown_path} (template: {})",
+        terminal_safe(&args.template)
     );
 
     registry.tests.push(project::TestDefinition {
@@ -316,9 +330,9 @@ fn handle_add(args: AddArgs, ctx: &AppContext) -> Result<(), CliError> {
         id: Some(test_id),
     });
     project::save_tests(&registry)?;
-    println!("Added test '{}' to tests.json", args.name);
+    println!("Added test '{shown_name}' to tests.json");
     println!(
-        "Edit {config_path} to customize your test, then run 'elevenlabs tests push' to update"
+        "Edit {shown_path} to customize your test, then run 'elevenlabs tests push' to update"
     );
     Ok(())
 }
@@ -352,9 +366,10 @@ fn handle_delete(args: DeleteArgs, ctx: &AppContext) -> Result<(), CliError> {
                 .or_else(|| test.id.clone())
                 .unwrap_or_else(|| "Unknown".to_string());
             println!(
-                "  {}. {name} ({})",
+                "  {}. {} ({})",
                 i + 1,
-                test.id.as_deref().unwrap_or("no id")
+                terminal_safe(&name),
+                terminal_safe(test.id.as_deref().unwrap_or("no id"))
             );
         }
         if !args.yes {
@@ -372,13 +387,17 @@ fn handle_delete(args: DeleteArgs, ctx: &AppContext) -> Result<(), CliError> {
                 .or_else(|| test.id.clone())
                 .unwrap_or_else(|| "Unknown".to_string());
             println!(
-                "Deleting '{name}' ({})...",
-                test.id.as_deref().unwrap_or("no id")
+                "Deleting '{}' ({})...",
+                terminal_safe(&name),
+                terminal_safe(test.id.as_deref().unwrap_or("no id"))
             );
             match &test.id {
                 Some(id) => match api::delete_test(ctx, id) {
                     Ok(()) => println!("  ✓ Deleted from ElevenLabs"),
-                    Err(e) => eprintln!("  Warning: Failed to delete from ElevenLabs: {e}"),
+                    Err(e) => eprintln!(
+                        "  Warning: Failed to delete from ElevenLabs: {}",
+                        terminal_safe(&e.to_string())
+                    ),
                 },
                 None => println!("  Warning: No test ID found, skipping ElevenLabs deletion"),
             }
@@ -406,21 +425,28 @@ fn handle_delete(args: DeleteArgs, ctx: &AppContext) -> Result<(), CliError> {
             ))
         })?;
     let removed = registry.tests.remove(index);
-    let name = test_name_from_config(&removed.config).unwrap_or_else(|| test_id.clone());
+    let name =
+        terminal_safe(&test_name_from_config(&removed.config).unwrap_or_else(|| test_id.clone()));
 
-    println!("Deleting test '{name}' (ID: {test_id})...");
+    println!(
+        "Deleting test '{name}' (ID: {})...",
+        terminal_safe(&test_id)
+    );
     println!("Deleting from ElevenLabs...");
     match api::delete_test(ctx, &test_id) {
         Ok(()) => println!("✓ Successfully deleted from ElevenLabs"),
         Err(e) => {
-            eprintln!("Warning: Failed to delete from ElevenLabs: {e}");
+            eprintln!(
+                "Warning: Failed to delete from ElevenLabs: {}",
+                terminal_safe(&e.to_string())
+            );
             println!("Continuing with local deletion...");
         }
     }
     project::save_tests(&registry)?;
     println!("✓ Removed '{name}' from tests.json");
     if remove_config_file(&removed.config) {
-        println!("✓ Deleted config file: {}", removed.config);
+        println!("✓ Deleted config file: {}", terminal_safe(&removed.config));
     }
     println!("\n✓ Successfully deleted test '{name}'");
     Ok(())
@@ -461,7 +487,10 @@ fn handle_push(matches: &clap::ArgMatches, ctx: &AppContext) -> Result<(), CliEr
     // Auto-register any untracked test configs before pushing.
     let discovered = register_discovered(&mut registry, &config_dir);
     if discovered > 0 {
-        println!("Discovered {discovered} test config(s) in {config_dir}");
+        println!(
+            "Discovered {discovered} test config(s) in {}",
+            terminal_safe(&config_dir)
+        );
     }
     if !tests_file_exists && registry.tests.is_empty() {
         return Err(CliError::Validation(format!(
@@ -497,23 +526,28 @@ fn handle_push(matches: &clap::ArgMatches, ctx: &AppContext) -> Result<(), CliEr
         let config_path = registry.tests[idx].config.clone();
         let current_id = registry.tests[idx].id.clone();
 
+        let shown_path = terminal_safe(&config_path);
         if !Path::new(&config_path).exists() {
-            println!("Warning: Config file not found: {config_path}");
+            println!("Warning: Config file not found: {shown_path}");
             continue;
         }
         let test_config = match project::read_value_in_project(&config_path) {
             Ok(v) => v,
             Err(e) => {
-                println!("Error reading config from {config_path}: {e}");
+                println!(
+                    "Error reading config from {shown_path}: {}",
+                    terminal_safe(&e.to_string())
+                );
                 failed += 1;
                 continue;
             }
         };
-        let name = test_config
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or("Unnamed Test")
-            .to_string();
+        let name = terminal_safe(
+            test_config
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("Unnamed Test"),
+        );
 
         println!("{name}: Will push (force override)");
         if dry_run {
@@ -530,7 +564,7 @@ fn handle_push(matches: &clap::ArgMatches, ctx: &AppContext) -> Result<(), CliEr
             None => match api::create_test(ctx, &test_config) {
                 Ok(response) => match test_id_of(&response) {
                     Some(new_id) => {
-                        println!("Created test {name} (ID: {new_id})");
+                        println!("Created test {name} (ID: {})", terminal_safe(&new_id));
                         registry.tests[idx].id = Some(new_id);
                         changes_made = true;
                     }
@@ -542,17 +576,17 @@ fn handle_push(matches: &clap::ArgMatches, ctx: &AppContext) -> Result<(), CliEr
                     }
                 },
                 Err(e) => {
-                    println!("Error processing {name}: {e}");
+                    println!("Error processing {name}: {}", terminal_safe(&e.to_string()));
                     failed += 1;
                 }
             },
             Some(id) => match api::update_test(ctx, id, &test_config) {
                 Ok(_) => {
-                    println!("Updated test {name} (ID: {id})");
+                    println!("Updated test {name} (ID: {})", terminal_safe(id));
                     changes_made = true;
                 }
                 Err(e) => {
-                    println!("Error processing {name}: {e}");
+                    println!("Error processing {name}: {}", terminal_safe(&e.to_string()));
                     failed += 1;
                 }
             },
@@ -631,7 +665,7 @@ fn handle_pull(matches: &clap::ArgMatches, ctx: &AppContext) -> Result<(), CliEr
 
     // Build the remote work list: (test_id, name).
     let remote: Vec<(String, String)> = if let Some(test) = &test_filter {
-        println!("Pulling test with ID: {test}...");
+        println!("Pulling test with ID: {}...", terminal_safe(test));
         let details = api::get_test(ctx, test).map_err(|e| {
             CliError::Validation(format!("Failed to fetch test with ID '{test}': {e}"))
         })?;
@@ -641,7 +675,7 @@ fn handle_pull(matches: &clap::ArgMatches, ctx: &AppContext) -> Result<(), CliEr
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        println!("Found test: {name}");
+        println!("Found test: {}", terminal_safe(&name));
         vec![(id, name)]
     } else {
         println!("Pulling all tests from ElevenLabs...");
@@ -703,7 +737,9 @@ fn handle_pull(matches: &clap::ArgMatches, ctx: &AppContext) -> Result<(), CliEr
     let mut processed = 0;
     // Configs that couldn't be written; the rest are still registered.
     let mut failed = 0;
-    for (action, id, name, existing_idx) in &plan {
+    for (action, id, raw_name, existing_idx) in &plan {
+        let name = terminal_safe(raw_name);
+        let shown_id = terminal_safe(id);
         if *action == PullAction::Skip {
             println!("⊘ Skipping '{name}' (already exists, use --update to overwrite)");
             continue;
@@ -714,7 +750,7 @@ fn handle_pull(matches: &clap::ArgMatches, ctx: &AppContext) -> Result<(), CliEr
             } else {
                 "pull"
             };
-            println!("[DRY RUN] Would {verb} test: {name} (ID: {id})");
+            println!("[DRY RUN] Would {verb} test: {name} (ID: {shown_id})");
             continue;
         }
 
@@ -728,7 +764,10 @@ fn handle_pull(matches: &clap::ArgMatches, ctx: &AppContext) -> Result<(), CliEr
         let config = match api::get_test(ctx, id) {
             Ok(v) => v,
             Err(e) => {
-                println!("  ✗ Error pulling test '{name}': {e}");
+                println!(
+                    "  ✗ Error pulling test '{name}': {}",
+                    terminal_safe(&e.to_string())
+                );
                 continue;
             }
         };
@@ -738,18 +777,27 @@ fn handle_pull(matches: &clap::ArgMatches, ctx: &AppContext) -> Result<(), CliEr
             Some(i) => {
                 let cfg_path = registry.tests[*i].config.clone();
                 if let Err(e) = project::write_config_in_project(&cfg_path, &config) {
-                    println!("  ✗ Error saving '{name}': {e}");
+                    println!(
+                        "  ✗ Error saving '{name}': {}",
+                        terminal_safe(&e.to_string())
+                    );
                     failed += 1;
                     continue;
                 }
-                println!("  ✓ Updated '{name}' (config: {cfg_path})");
+                println!(
+                    "  ✓ Updated '{name}' (config: {})",
+                    terminal_safe(&cfg_path)
+                );
             }
             None => {
-                let cfg_path = project::generate_unique_filename(&output_dir, name, ".json")
+                let cfg_path = project::generate_unique_filename(&output_dir, raw_name, ".json")
                     .display()
                     .to_string();
                 if let Err(e) = project::write_config_in_project(&cfg_path, &config) {
-                    println!("  ✗ Error saving '{name}': {e}");
+                    println!(
+                        "  ✗ Error saving '{name}': {}",
+                        terminal_safe(&e.to_string())
+                    );
                     failed += 1;
                     continue;
                 }
@@ -758,7 +806,7 @@ fn handle_pull(matches: &clap::ArgMatches, ctx: &AppContext) -> Result<(), CliEr
                     test_type,
                     id: Some(id.clone()),
                 });
-                println!("  ✓ Added '{name}' (config: {cfg_path})");
+                println!("  ✓ Added '{name}' (config: {})", terminal_safe(&cfg_path));
             }
         }
         processed += 1;
@@ -775,7 +823,8 @@ fn handle_pull(matches: &clap::ArgMatches, ctx: &AppContext) -> Result<(), CliEr
         println!("\n✓ Summary: {n_create} created, {n_update} updated, {n_skip} skipped");
         if processed > 0 {
             println!(
-                "You can now edit the config files in '{output_dir}/' and attach them to your agents"
+                "You can now edit the config files in '{}/' and attach them to your agents",
+                terminal_safe(&output_dir)
             );
         }
     }
