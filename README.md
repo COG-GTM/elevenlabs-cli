@@ -92,7 +92,7 @@ Every request is authenticated with an [ElevenLabs API key](https://elevenlabs.i
 export ELEVENLABS_API_KEY=xi-...
 ```
 
-A `.env` file in the working directory is loaded automatically, so putting `ELEVENLABS_API_KEY=xi-...` there works too — handy for keeping a key scoped to one project.
+A `.env` file in the working directory is loaded automatically, so putting `ELEVENLABS_API_KEY=xi-...` there works too — handy for keeping a key scoped to one project. Only `ELEVENLABS_*` settings (plus `NO_COLOR` and `DO_NOT_TRACK`) are read from `.env`; anything that redirects traffic or makes the CLI or its pager run a program (`ELEVENLABS_BASE_URL`, `ELEVENLABS_PAGER`, `PAGER`, `LESSOPEN`, proxies, …) must be exported from your shell.
 
 For a one-off call, pass it per command instead:
 
