@@ -76,7 +76,7 @@ pub(super) async fn sign_in(login: Login<'_>) -> Result<String, CliError> {
     // `Session::url` reads the link from the `URL:` line.
     eprintln!("Opening browser to authenticate…\n  URL: {url}\n  Listening on {redirect_uri}");
     if !login.no_browser {
-        let _ = webbrowser::open(&url);
+        let _ = fern_cli_sdk::open_browser(&url);
     }
     let (code, mut browser) =
         wait_for_callback(listeners, &state, login.error_url, login.timeout).await?;

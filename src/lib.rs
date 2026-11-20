@@ -96,6 +96,54 @@ const DOTENV_DENIED_BARE: &[&str] = &[
     "SSL_CERT_DIR",
     "CURL_CA_BUNDLE",
     "REQUESTS_CA_BUNDLE",
+    "OPENSSL_CONF",
+    "OPENSSL_ENGINES",
+    "OPENSSL_MODULES",
+    "SSLKEYLOGFILE",
+    // Decide where the CLI reads its settings (including the audio player
+    // `say` runs) and stored credentials, and where it looks up programs.
+    "HOME",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
+    "SYSTEMROOT",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "PATH",
+    "PATHEXT",
+    // Name programs, or code, that a started program runs.
+    "SHELL",
+    "COMSPEC",
+    "EDITOR",
+    "VISUAL",
+    "BASH_ENV",
+    "ENV",
+    "ZDOTDIR",
+    "IFS",
+    "NODE_OPTIONS",
+    "NODE_PATH",
+    "PERL5OPT",
+    "PERL5LIB",
+    "RUBYOPT",
+    "RUBYLIB",
+    "GCONV_PATH",
+];
+
+/// Prefixes of unscoped env vars a `.env` file may not set: dynamic-loader
+/// injection (`LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`), `less` input
+/// preprocessors (`LESSOPEN`), and the config of npm, git, Python and the XDG
+/// base directories, each of which can make a started program run a command.
+const DOTENV_DENIED_PREFIXES: &[&str] = &[
+    "LD_",
+    "DYLD_",
+    "LESS",
+    "NPM_CONFIG_",
+    "GIT_",
+    "XDG_",
+    "PYTHON",
+    "BASH_FUNC_",
 ];
 
 /// Suffixes of `<PREFIX>_…` env vars a `.env` file may not set. Same
@@ -122,7 +170,9 @@ const DOTENV_DENIED_SUFFIXES: &[&str] = &[
 /// Windows treats environment names as case-insensitive.
 pub(crate) fn dotenv_key_is_denied(key: &str, prefix: &str) -> bool {
     let key = key.to_ascii_uppercase();
-    if DOTENV_DENIED_BARE.contains(&key.as_str()) {
+    if DOTENV_DENIED_BARE.contains(&key.as_str())
+        || DOTENV_DENIED_PREFIXES.iter().any(|p| key.starts_with(p))
+    {
         return true;
     }
     key.strip_prefix(prefix)
@@ -165,9 +215,58 @@ pub fn load_dotenv_filtered(cli_name: &str) -> Vec<String> {
         // Real environment wins, as with `dotenvy::dotenv()`.
         if std::env::var_os(&key).is_none() {
             std::env::set_var(&key, &value);
+            record_dotenv_key(key);
         }
     }
     ignored
+}
+
+/// The keys [`load_dotenv_filtered`] added to this process's environment.
+static DOTENV_LOADED_KEYS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn record_dotenv_key(key: String) {
+    let mut keys = DOTENV_LOADED_KEYS.lock().unwrap_or_else(|e| e.into_inner());
+    if !keys.contains(&key) {
+        keys.push(key);
+    }
+}
+
+/// The keys this process took from `.env` rather than from the shell.
+pub fn dotenv_loaded_keys() -> Vec<String> {
+    DOTENV_LOADED_KEYS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// Start `cmd` with the environment the shell gave this process: none of the
+/// values loaded from `.env`, which a repository's author controls and which
+/// must never configure a program the CLI starts (pager, audio player, `npx`).
+pub fn without_dotenv_env(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    for key in dotenv_loaded_keys() {
+        cmd.env_remove(key);
+    }
+    cmd
+}
+
+/// Open `url` in the browser without the values loaded from `.env`.
+///
+/// `webbrowser` starts its opener with this process's environment and takes
+/// no `Command`, so the `.env` keys are removed for the duration of the call
+/// and then put back for the credential lookups that follow.
+pub fn open_browser(url: &str) -> std::io::Result<()> {
+    let loaded: Vec<(String, std::ffi::OsString)> = dotenv_loaded_keys()
+        .into_iter()
+        .filter_map(|key| std::env::var_os(&key).map(|value| (key, value)))
+        .collect();
+    for (key, _) in &loaded {
+        std::env::remove_var(key);
+    }
+    let result = webbrowser::open(url);
+    for (key, value) in loaded {
+        std::env::set_var(key, value);
+    }
+    result
 }
 
 /// Report the keys [`load_dotenv_filtered`] dropped. Call after
@@ -247,6 +346,48 @@ mod dotenv_filter_tests {
     }
 
     #[test]
+    fn loader_and_child_program_keys_are_denied_from_dotenv() {
+        // Each of these makes a program the CLI starts (pager, browser opener,
+        // audio player, `npx`) load or run attacker code, or relocates the
+        // settings file that names the audio player.
+        for key in [
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "LD_AUDIT",
+            "DYLD_INSERT_LIBRARIES",
+            "DYLD_LIBRARY_PATH",
+            "LESSOPEN",
+            "LESSCLOSE",
+            "LESS",
+            "LESSKEY",
+            "NODE_OPTIONS",
+            "npm_config_script_shell",
+            "NPM_CONFIG_USERCONFIG",
+            "HOME",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "XDG_CONFIG_HOME",
+            "PATH",
+            "Path",
+            "SHELL",
+            "EDITOR",
+            "VISUAL",
+            "GIT_SSH_COMMAND",
+            "GIT_CONFIG_GLOBAL",
+            "OPENSSL_CONF",
+            "PYTHONPATH",
+            "BASH_ENV",
+            "ld_preload",
+        ] {
+            assert!(
+                dotenv_key_is_denied(key, "ELEVENLABS"),
+                "{key} must not be settable from .env"
+            );
+        }
+    }
+
+    #[test]
     fn dotenv_cannot_disable_the_cross_host_guards() {
         // Otherwise a `.env` could undo the redirect and pagination
         // protections, which is the whole point of having them.
@@ -268,6 +409,18 @@ mod dotenv_filter_tests {
         assert!(!dotenv_key_is_denied("BASE_URL", "ELEVENLABS"));
         // Kebab-cased binary names map to underscored prefixes.
         assert!(dotenv_key_is_denied("MY_CLI_BASE_URL", "MY_CLI"));
+    }
+
+    #[test]
+    fn child_programs_do_not_inherit_dotenv_values() {
+        let key = "FERN_CLI_TEST_DOTENV_CHILD_SCRUB";
+        super::record_dotenv_key(key.to_string());
+        let mut cmd = std::process::Command::new("true");
+        super::without_dotenv_env(&mut cmd);
+        let removed = cmd
+            .get_envs()
+            .any(|(k, v)| k == std::ffi::OsStr::new(key) && v.is_none());
+        assert!(removed, "{key} loaded from .env must be removed from children");
     }
 
     #[test]

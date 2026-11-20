@@ -294,7 +294,7 @@ async fn run_device_code(
         let _ = err.flush();
     }
     if !no_browser {
-        let _ = webbrowser::open(&verification_url);
+        let _ = crate::open_browser(&verification_url);
     }
 
     // 3. Poll the token endpoint.
@@ -761,7 +761,7 @@ async fn run_pkce(mut flow: PkceLoginFlow, ctx: LoginContext) -> Result<(), CliE
         let _ = err.flush();
     }
     if !ctx.no_browser {
-        let _ = webbrowser::open(&url);
+        let _ = crate::open_browser(&url);
     }
 
     // Wait for the browser to hit /callback with code+state. The listener checks the `state` it
