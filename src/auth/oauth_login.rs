@@ -696,15 +696,126 @@ impl LoginFlow for PkceLoginFlow {
     }
 }
 
-/// Bind a loopback TCP listener on the first available port in `candidate_ports` (tried in order).
-/// Pass `[0]` for an ephemeral (OS-assigned) port. Returns the bound listener, or an error naming
-/// every candidate when all are taken.
-async fn bind_loopback_listener(host: &str, candidate_ports: &[u16]) -> Result<TcpListener, CliError> {
+/// The loopback callback listener: one socket per loopback address the redirect host names, all on
+/// the same port. `localhost` resolves to both `127.0.0.1` and `::1` and the browser may use either,
+/// so binding only one would leave the other free for any local process to take and receive the
+/// callback in our place (RFC 8252 §8.3).
+#[derive(Debug)]
+struct LoopbackListener {
+    listeners: Vec<TcpListener>,
+}
+
+impl From<TcpListener> for LoopbackListener {
+    fn from(listener: TcpListener) -> Self {
+        Self { listeners: vec![listener] }
+    }
+}
+
+impl LoopbackListener {
+    fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        self.listeners[0].local_addr()
+    }
+
+    #[cfg(test)]
+    fn local_addrs(&self) -> Vec<std::net::SocketAddr> {
+        self.listeners.iter().filter_map(|l| l.local_addr().ok()).collect()
+    }
+
+    /// Accept the next connection on whichever address it arrives at.
+    async fn accept(&self) -> std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)> {
+        std::future::poll_fn(|cx| {
+            for listener in &self.listeners {
+                if let std::task::Poll::Ready(r) = listener.poll_accept(cx) {
+                    return std::task::Poll::Ready(r);
+                }
+            }
+            std::task::Poll::Pending
+        })
+        .await
+    }
+}
+
+/// Every loopback address the redirect host can reach the CLI on. `localhost` is expanded to both
+/// families instead of resolved, so a resolver that lists only one cannot leave the other unbound.
+async fn loopback_addrs(host: &str) -> Result<Vec<std::net::IpAddr>, CliError> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    if host.eq_ignore_ascii_case("localhost") {
+        return Ok(vec![IpAddr::V4(Ipv4Addr::LOCALHOST), IpAddr::V6(Ipv6Addr::LOCALHOST)]);
+    }
+    let literal = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+    if let Ok(ip) = literal.parse::<IpAddr>() {
+        return Ok(vec![ip]);
+    }
+    let mut addrs: Vec<IpAddr> = Vec::new();
+    for addr in tokio::net::lookup_host((host, 0))
+        .await
+        .map_err(|e| CliError::Auth(format!("could not resolve callback host {host}: {e}")))?
+    {
+        if !addrs.contains(&addr.ip()) {
+            addrs.push(addr.ip());
+        }
+    }
+    Ok(addrs)
+}
+
+/// The address doesn't exist on this machine (e.g. IPv6 disabled), so no other process can listen
+/// on it either and no browser can connect to it. Safe to skip.
+fn is_unavailable_address(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::Unsupported
+    ) || matches!(e.raw_os_error(), Some(code) if code == EAFNOSUPPORT)
+}
+
+#[cfg(unix)]
+const EAFNOSUPPORT: i32 = libc::EAFNOSUPPORT;
+#[cfg(windows)]
+const EAFNOSUPPORT: i32 = 10047; // WSAEAFNOSUPPORT
+#[cfg(not(any(unix, windows)))]
+const EAFNOSUPPORT: i32 = -1;
+
+/// Bind every address in `addrs` on `port` (`0` = let the OS pick one for the first address and
+/// reuse it for the rest). Fails if any reachable address on that port can't be bound.
+async fn bind_all_on_port(addrs: &[std::net::IpAddr], port: u16) -> std::io::Result<LoopbackListener> {
+    let mut listeners: Vec<TcpListener> = Vec::with_capacity(addrs.len());
+    let mut port = port;
+    let mut unavailable: Option<std::io::Error> = None;
+    for &ip in addrs {
+        match TcpListener::bind((ip, port)).await {
+            Ok(listener) => {
+                if port == 0 {
+                    port = listener.local_addr()?.port();
+                }
+                listeners.push(listener);
+            }
+            Err(e) if is_unavailable_address(&e) => unavailable = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    if listeners.is_empty() {
+        return Err(unavailable
+            .unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no loopback address")));
+    }
+    Ok(LoopbackListener { listeners })
+}
+
+/// How many OS-assigned ports to try when the one picked for the first address is already taken
+/// on another.
+const EPHEMERAL_BIND_ATTEMPTS: usize = 16;
+
+/// Bind the loopback listener on the first port in `candidate_ports` (tried in order) that is free
+/// on every loopback address `host` names. Pass `[0]` for an ephemeral (OS-assigned) port. Returns
+/// the bound listener, or an error naming every candidate when all are taken.
+async fn bind_loopback_listener(host: &str, candidate_ports: &[u16]) -> Result<LoopbackListener, CliError> {
+    let addrs = loopback_addrs(host).await?;
     let mut last_err: Option<String> = None;
     for &port in candidate_ports {
-        match TcpListener::bind((host, port)).await {
-            Ok(listener) => return Ok(listener),
-            Err(e) => last_err = Some(e.to_string()),
+        let attempts = if port == 0 { EPHEMERAL_BIND_ATTEMPTS } else { 1 };
+        for _ in 0..attempts {
+            match bind_all_on_port(&addrs, port).await {
+                Ok(listener) => return Ok(listener),
+                Err(e) => last_err = Some(e.to_string()),
+            }
         }
     }
     let ports = candidate_ports
@@ -928,7 +1039,7 @@ const PKCE_CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 /// returns an error; a usable one returns the code plus the still-open connection, so the caller
 /// answers the browser once it knows whether the login actually worked.
 async fn accept_callback<'a>(
-    listener: &TcpListener,
+    listener: &LoopbackListener,
     expected_path: &str,
     expected_state: &str,
     pages: CallbackPages<'a>,
@@ -937,7 +1048,7 @@ async fn accept_callback<'a>(
 }
 
 async fn accept_callback_with_timeout<'a>(
-    listener: &TcpListener,
+    listener: &LoopbackListener,
     expected_path: &str,
     expected_state: &str,
     pages: CallbackPages<'a>,
@@ -960,7 +1071,7 @@ async fn accept_callback_with_timeout<'a>(
 }
 
 async fn accept_callback_inner<'a>(
-    listener: &TcpListener,
+    listener: &LoopbackListener,
     expected_path: &str,
     expected_state: &str,
     pages: CallbackPages<'a>,
@@ -2064,6 +2175,110 @@ mod tests {
         assert_ne!(listener.local_addr().unwrap().port(), 0);
     }
 
+    /// Whether this machine has an IPv6 loopback to test against.
+    async fn ipv6_loopback_available() -> bool {
+        TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)).await.is_ok()
+    }
+
+    /// A port that is currently free on both 127.0.0.1 and ::1.
+    async fn pick_dual_stack_free_port() -> u16 {
+        loop {
+            let v4 = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let port = v4.local_addr().unwrap().port();
+            if TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)).await.is_ok() {
+                return port;
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bind_loopback_listener_localhost_binds_both_loopback_addresses() {
+        // `localhost` reaches the CLI over either family; both must be ours, on the same port.
+        let listener = bind_loopback_listener("localhost", &[0]).await.unwrap();
+        let addrs = listener.local_addrs();
+        let port = listener.local_addr().unwrap().port();
+        assert!(addrs.iter().all(|a| a.port() == port), "all sockets share one port: {addrs:?}");
+        assert!(addrs.iter().any(|a| a.ip() == std::net::Ipv4Addr::LOCALHOST), "127.0.0.1 bound: {addrs:?}");
+        if ipv6_loopback_available().await {
+            assert!(addrs.iter().any(|a| a.ip() == std::net::Ipv6Addr::LOCALHOST), "::1 bound: {addrs:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bind_loopback_listener_localhost_skips_port_held_on_ipv6() {
+        // sfind-374d9dd2: a local process holding [::1]:<port> must not leave the CLI on
+        // 127.0.0.1:<port> alone, where a browser preferring IPv6 would hand it the callback.
+        if !ipv6_loopback_available().await {
+            eprintln!("skipping: no IPv6 loopback on this machine");
+            return;
+        }
+        let taken = pick_dual_stack_free_port().await;
+        let squatter = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, taken)).await.unwrap();
+        let free = loop {
+            let p = pick_dual_stack_free_port().await;
+            if p != taken {
+                break p;
+            }
+        };
+
+        let listener = bind_loopback_listener("localhost", &[taken, free]).await.unwrap();
+        let addrs = listener.local_addrs();
+        assert!(
+            addrs.iter().all(|a| a.port() == free),
+            "must move off the port held on ::1 for both addresses: {addrs:?}"
+        );
+        assert!(addrs.iter().any(|a| a.ip() == std::net::Ipv6Addr::LOCALHOST), "::1 bound: {addrs:?}");
+        assert!(addrs.iter().any(|a| a.ip() == std::net::Ipv4Addr::LOCALHOST), "127.0.0.1 bound: {addrs:?}");
+        // The half-bound 127.0.0.1:<taken> socket was released, not leaked.
+        TcpListener::bind(("127.0.0.1", taken)).await.expect("127.0.0.1:taken released");
+        drop(squatter);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bind_loopback_listener_localhost_errors_when_ipv6_held_on_every_port() {
+        if !ipv6_loopback_available().await {
+            eprintln!("skipping: no IPv6 loopback on this machine");
+            return;
+        }
+        let pa = pick_dual_stack_free_port().await;
+        let a = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, pa)).await.unwrap();
+        let pb = loop {
+            let p = pick_dual_stack_free_port().await;
+            if p != pa {
+                break p;
+            }
+        };
+        let b = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, pb)).await.unwrap();
+
+        let err = bind_loopback_listener("localhost", &[pa, pb]).await.err().expect("must refuse to start");
+        let msg = format!("{err}");
+        assert!(msg.contains(&pa.to_string()) && msg.contains(&pb.to_string()), "error should name all ports: {msg}");
+        drop((a, b));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pkce_loopback_localhost_accepts_callback_over_ipv6_and_ipv4() {
+        // Whichever family the browser picks for `localhost`, the CLI is the one answering.
+        if !ipv6_loopback_available().await {
+            eprintln!("skipping: no IPv6 loopback on this machine");
+            return;
+        }
+        for host in ["[::1]", "127.0.0.1"] {
+            let listener = bind_loopback_listener("localhost", &[0]).await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let acceptor = tokio::spawn(async move {
+                accept_and_confirm(&listener, "/callback", "state-xyz", CallbackPages::default()).await
+            });
+            let resp = reqwest::Client::new()
+                .get(format!("http://{host}:{port}/callback?code=auth-code-abc&state=state-xyz"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "callback via {host}");
+            assert_eq!(acceptor.await.unwrap().unwrap(), "auth-code-abc", "callback via {host}");
+        }
+    }
+
     #[test]
     fn pkce_redirect_ports_sets_primary_and_backups() {
         let flow = PkceLoginFlow::new("OAuth2")
@@ -2137,7 +2352,7 @@ mod tests {
     /// and keyring write that succeeded — answer the browser. Tests that assert on the success
     /// response have to go through this, because nothing is written until the caller says so.
     async fn accept_and_confirm(
-        listener: &TcpListener,
+        listener: &LoopbackListener,
         expected_path: &str,
         expected_state: &str,
         pages: CallbackPages<'_>,
@@ -2149,7 +2364,7 @@ mod tests {
 
     /// Mirror `run_pkce`'s post-callback failure path: the callback was fine, the login wasn't.
     async fn accept_and_fail(
-        listener: &TcpListener,
+        listener: &LoopbackListener,
         expected_path: &str,
         expected_state: &str,
         pages: CallbackPages<'_>,
@@ -2169,7 +2384,7 @@ mod tests {
         // with a 100ms cap so the test runs at wall-clock speed instead
         // of waiting the production 5-minute deadline.
         let port = pick_free_port();
-        let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        let listener = LoopbackListener::from(TcpListener::bind(("127.0.0.1", port)).await.unwrap());
         let err = accept_callback_with_timeout(
             &listener,
             "/callback",
@@ -2190,7 +2405,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn pkce_loopback_handshake_returns_code() {
         let port = pick_free_port();
-        let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        let listener = LoopbackListener::from(TcpListener::bind(("127.0.0.1", port)).await.unwrap());
 
         // Spawn the accept task.
         let acceptor = tokio::spawn(async move {
@@ -2213,7 +2428,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn pkce_loopback_redirects_to_configured_success_page() {
         let port = pick_free_port();
-        let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        let listener = LoopbackListener::from(TcpListener::bind(("127.0.0.1", port)).await.unwrap());
         let acceptor = tokio::spawn(async move {
             accept_and_confirm(
                 &listener,
@@ -2253,7 +2468,7 @@ mod tests {
         // The invariant the responder buys: a valid callback gets *no* response while the caller is
         // still exchanging the code. Drive the browser from a task so we can observe it waiting.
         let port = pick_free_port();
-        let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        let listener = LoopbackListener::from(TcpListener::bind(("127.0.0.1", port)).await.unwrap());
         let mut browser = tokio::spawn(async move {
             reqwest::Client::new()
                 .get(format!("http://127.0.0.1:{port}/callback?code=c&state=s"))
@@ -2287,7 +2502,7 @@ mod tests {
         // Now nothing is written until the caller decides, and a caller that failed gets the
         // failure page — on a configured error URL, not the configured success one.
         let port = pick_free_port();
-        let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        let listener = LoopbackListener::from(TcpListener::bind(("127.0.0.1", port)).await.unwrap());
         let pages = CallbackPages {
             success_redirect_url: Some("https://acme.com/cli/success"),
             error_redirect_url: Some("https://acme.com/cli/error"),
@@ -2320,7 +2535,7 @@ mod tests {
     async fn pkce_loopback_builtin_failure_page_when_login_fails_after_a_valid_callback() {
         // Same, with no hosted pages configured: the built-in failure page, not the success one.
         let port = pick_free_port();
-        let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        let listener = LoopbackListener::from(TcpListener::bind(("127.0.0.1", port)).await.unwrap());
         let acceptor = tokio::spawn(async move {
             accept_and_fail(&listener, "/callback", "state-xyz", CallbackPages::default()).await
         });
@@ -2344,7 +2559,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn pkce_loopback_falls_back_to_builtin_page_for_unsafe_redirect() {
         let port = pick_free_port();
-        let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        let listener = LoopbackListener::from(TcpListener::bind(("127.0.0.1", port)).await.unwrap());
         let acceptor = tokio::spawn(async move {
             accept_and_confirm(
                 &listener,
@@ -2379,7 +2594,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn pkce_loopback_redirects_to_configured_error_page_with_params() {
         let port = pick_free_port();
-        let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        let listener = LoopbackListener::from(TcpListener::bind(("127.0.0.1", port)).await.unwrap());
         let acceptor = tokio::spawn(async move {
             accept_and_confirm(
                 &listener,
@@ -2418,7 +2633,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn pkce_loopback_error_page_renders_server_error_escaped() {
         let port = pick_free_port();
-        let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        let listener = LoopbackListener::from(TcpListener::bind(("127.0.0.1", port)).await.unwrap());
         let acceptor = tokio::spawn(async move {
             accept_and_confirm(&listener, "/callback", "state-xyz", CallbackPages::default()).await
         });
@@ -2444,7 +2659,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn pkce_loopback_redirects_unusable_callback_with_synthesized_error() {
         let port = pick_free_port();
-        let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        let listener = LoopbackListener::from(TcpListener::bind(("127.0.0.1", port)).await.unwrap());
         let pages = CallbackPages {
             success_redirect_url: Some("https://acme.com/cli/success"),
             error_redirect_url: Some("https://acme.com/cli/error"),
@@ -2492,7 +2707,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn pkce_loopback_handshake_rejects_missing_code() {
         let port = pick_free_port();
-        let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        let listener = LoopbackListener::from(TcpListener::bind(("127.0.0.1", port)).await.unwrap());
         let acceptor = tokio::spawn(async move {
             accept_and_confirm(&listener, "/callback", "only-state", CallbackPages::default()).await
         });
@@ -2512,7 +2727,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn pkce_loopback_handshake_surfaces_authorization_error_param() {
         let port = pick_free_port();
-        let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        let listener = LoopbackListener::from(TcpListener::bind(("127.0.0.1", port)).await.unwrap());
         let acceptor = tokio::spawn(async move {
             accept_and_confirm(&listener, "/callback", "state-xyz", CallbackPages::default()).await
         });
@@ -2534,7 +2749,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn pkce_loopback_ignores_favicon_and_accepts_callback() {
         let port = pick_free_port();
-        let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        let listener = LoopbackListener::from(TcpListener::bind(("127.0.0.1", port)).await.unwrap());
         let acceptor =
             tokio::spawn(async move { accept_and_confirm(&listener, "/callback", "s1", CallbackPages::default()).await });
 
@@ -2563,7 +2778,7 @@ mod tests {
         // listener — not just advertised in the authorize URL — or the browser callback 404s and
         // login hangs. The listener accepts the configured path and ignores the default one.
         let port = pick_free_port();
-        let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        let listener = LoopbackListener::from(TcpListener::bind(("127.0.0.1", port)).await.unwrap());
         let acceptor = tokio::spawn(async move {
             accept_and_confirm(&listener, "/oauth/callback", "s2", CallbackPages::default()).await
         });
@@ -2594,7 +2809,7 @@ mod tests {
         // the login *and* answer the browser with the failure page — the success page is written
         // only after this check passes.
         let port = pick_free_port();
-        let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        let listener = LoopbackListener::from(TcpListener::bind(("127.0.0.1", port)).await.unwrap());
         let acceptor = tokio::spawn(async move {
             accept_and_confirm(&listener, "/callback", "expected-state", CallbackPages::default()).await
         });
@@ -2621,7 +2836,7 @@ mod tests {
         // Same check against a configured hosted page: the browser is handed to the *error* page,
         // and neither state value rides along — the one we issued is a per-login nonce.
         let port = pick_free_port();
-        let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        let listener = LoopbackListener::from(TcpListener::bind(("127.0.0.1", port)).await.unwrap());
         let pages = CallbackPages {
             success_redirect_url: Some("https://acme.com/cli/success"),
             error_redirect_url: Some("https://acme.com/cli/error"),
