@@ -9,7 +9,9 @@ use fern_cli_sdk::error::CliError;
 use fern_cli_sdk::openapi::AppContext;
 use serde_json::{json, Value};
 
-use super::util::{downcast_ctx, dry_run_flag, opt_string, plan_pull_action, PullAction};
+use super::util::{
+    downcast_ctx, dry_run_flag, opt_string, plan_pull_action, terminal_safe, PullAction,
+};
 use super::{api, project, verify};
 
 /// Register the `tools` command group.
@@ -132,9 +134,10 @@ fn handle_add(args: AddArgs, ctx: &AppContext) -> Result<(), CliError> {
         registry
     };
 
+    let display_name = terminal_safe(&args.name);
     println!(
-        "Creating {} tool '{}' in ElevenLabs...",
-        args.tool_type, args.name
+        "Creating {} tool '{display_name}' in ElevenLabs...",
+        args.tool_type
     );
     let response = api::create_tool(ctx, &config)?;
     let tool_id = tool_id_of(&response).ok_or_else(|| {
@@ -143,8 +146,9 @@ fn handle_add(args: AddArgs, ctx: &AppContext) -> Result<(), CliError> {
         ))
     })?;
     println!(
-        "Created {} tool in ElevenLabs with ID: {tool_id}",
-        args.tool_type
+        "Created {} tool in ElevenLabs with ID: {}",
+        args.tool_type,
+        terminal_safe(&tool_id)
     );
 
     let config_path = match &args.config_path {
@@ -154,7 +158,8 @@ fn handle_add(args: AddArgs, ctx: &AppContext) -> Result<(), CliError> {
             .to_string(),
     };
     project::write_config_in_project(&config_path, &config)?;
-    println!("Created config file: {config_path}");
+    let display_path = terminal_safe(&config_path);
+    println!("Created config file: {display_path}");
 
     registry.tools.push(project::ToolDefinition {
         tool_type: args.tool_type.clone(),
@@ -162,14 +167,24 @@ fn handle_add(args: AddArgs, ctx: &AppContext) -> Result<(), CliError> {
         id: Some(tool_id),
     });
     project::save_tools(&registry)?;
-    println!("Added tool '{}' to tools.json", args.name);
+    println!("Added tool '{display_name}' to tools.json");
     println!(
-        "Edit {config_path} to customize your tool, then run 'elevenlabs tools push' to update"
+        "Edit {display_path} to customize your tool, then run 'elevenlabs tools push' to update"
     );
     Ok(())
 }
 
 // ── delete ──────────────────────────────────────────────────────────
+
+/// The name and ID of an index entry, made safe to print: the name comes
+/// from the tool's config file and the ID from `tools.json`.
+fn tool_label(tool: &project::ToolDefinition) -> (String, String) {
+    let name = project::config_name(&tool.config)
+        .or_else(|| tool.id.clone())
+        .unwrap_or_else(|| "Unknown".to_string());
+    let id = tool.id.as_deref().unwrap_or("no id");
+    (terminal_safe(&name), terminal_safe(id))
+}
 
 #[derive(clap::Args)]
 struct DeleteArgs {
@@ -194,14 +209,8 @@ fn handle_delete(args: DeleteArgs, ctx: &AppContext) -> Result<(), CliError> {
         }
         println!("\nFound {} tool(s) to delete:", registry.tools.len());
         for (i, tool) in registry.tools.iter().enumerate() {
-            let name = project::config_name(&tool.config)
-                .or_else(|| tool.id.clone())
-                .unwrap_or_else(|| "Unknown".to_string());
-            println!(
-                "  {}. {name} ({})",
-                i + 1,
-                tool.id.as_deref().unwrap_or("no id")
-            );
+            let (name, id) = tool_label(tool);
+            println!("  {}. {name} ({id})", i + 1);
         }
         if !args.yes {
             println!(
@@ -214,17 +223,15 @@ fn handle_delete(args: DeleteArgs, ctx: &AppContext) -> Result<(), CliError> {
         }
         println!("\nDeleting tools...\n");
         for tool in &registry.tools {
-            let name = project::config_name(&tool.config)
-                .or_else(|| tool.id.clone())
-                .unwrap_or_else(|| "Unknown".to_string());
-            println!(
-                "Deleting '{name}' ({})...",
-                tool.id.as_deref().unwrap_or("no id")
-            );
+            let (name, id) = tool_label(tool);
+            println!("Deleting '{name}' ({id})...");
             match &tool.id {
                 Some(id) => match api::delete_tool(ctx, id) {
                     Ok(()) => println!("  ✓ Deleted from ElevenLabs"),
-                    Err(e) => eprintln!("  Warning: Failed to delete from ElevenLabs: {e}"),
+                    Err(e) => eprintln!(
+                        "  Warning: Failed to delete from ElevenLabs: {}",
+                        terminal_safe(&e.to_string())
+                    ),
                 },
                 None => println!("  Warning: No tool ID found, skipping ElevenLabs deletion"),
             }
@@ -252,21 +259,26 @@ fn handle_delete(args: DeleteArgs, ctx: &AppContext) -> Result<(), CliError> {
             ))
         })?;
     let removed = registry.tools.remove(index);
-    let name = project::config_name(&removed.config).unwrap_or_else(|| tool_id.clone());
+    let name =
+        terminal_safe(&project::config_name(&removed.config).unwrap_or_else(|| tool_id.clone()));
+    let display_id = terminal_safe(&tool_id);
 
-    println!("Deleting tool '{name}' (ID: {tool_id})...");
+    println!("Deleting tool '{name}' (ID: {display_id})...");
     println!("Deleting from ElevenLabs...");
     match api::delete_tool(ctx, &tool_id) {
         Ok(()) => println!("✓ Successfully deleted from ElevenLabs"),
         Err(e) => {
-            eprintln!("Warning: Failed to delete from ElevenLabs: {e}");
+            eprintln!(
+                "Warning: Failed to delete from ElevenLabs: {}",
+                terminal_safe(&e.to_string())
+            );
             println!("Continuing with local deletion...");
         }
     }
     project::save_tools(&registry)?;
     println!("✓ Removed '{name}' from tools.json");
     if remove_config_file(&removed.config) {
-        println!("✓ Deleted config file: {}", removed.config);
+        println!("✓ Deleted config file: {}", terminal_safe(&removed.config));
     }
     println!("\n✓ Successfully deleted tool '{name}'");
     Ok(())
@@ -279,7 +291,7 @@ fn remove_config_file(config_path: &str) -> bool {
     match project::remove_in_project(config_path) {
         Ok(removed) => removed,
         Err(e) => {
-            eprintln!("  Warning: {e}");
+            eprintln!("  Warning: {}", terminal_safe(&e.to_string()));
             false
         }
     }
@@ -329,28 +341,33 @@ fn handle_push(matches: &clap::ArgMatches, ctx: &AppContext) -> Result<(), CliEr
     for idx in indices {
         let config_path = registry.tools[idx].config.clone();
         let current_id = registry.tools[idx].id.clone();
+        let display_path = terminal_safe(&config_path);
 
         if config_path.is_empty() {
             println!("Warning: No config path specified");
             continue;
         }
         if !Path::new(&config_path).exists() {
-            println!("Warning: Config file not found: {config_path}");
+            println!("Warning: Config file not found: {display_path}");
             continue;
         }
         let tool_config = match project::read_value_in_project(&config_path) {
             Ok(v) => v,
             Err(e) => {
-                println!("Error reading config from {config_path}: {e}");
+                println!(
+                    "Error reading config from {display_path}: {}",
+                    terminal_safe(&e.to_string())
+                );
                 failed += 1;
                 continue;
             }
         };
-        let name = tool_config
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or("Unnamed Tool")
-            .to_string();
+        let name = terminal_safe(
+            tool_config
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("Unnamed Tool"),
+        );
 
         println!("{name}: Will push (force override)");
         if dry_run {
@@ -362,7 +379,7 @@ fn handle_push(matches: &clap::ArgMatches, ctx: &AppContext) -> Result<(), CliEr
             None => match api::create_tool(ctx, &tool_config) {
                 Ok(response) => match tool_id_of(&response) {
                     Some(new_id) => {
-                        println!("Created tool {name} (ID: {new_id})");
+                        println!("Created tool {name} (ID: {})", terminal_safe(&new_id));
                         verify::verify_tool_push(&name, &tool_config, &response);
                         registry.tools[idx].id = Some(new_id);
                         changes_made = true;
@@ -375,18 +392,18 @@ fn handle_push(matches: &clap::ArgMatches, ctx: &AppContext) -> Result<(), CliEr
                     }
                 },
                 Err(e) => {
-                    println!("Error processing {name}: {e}");
+                    println!("Error processing {name}: {}", terminal_safe(&e.to_string()));
                     failed += 1;
                 }
             },
             Some(id) => match api::update_tool(ctx, id, &tool_config) {
                 Ok(response) => {
-                    println!("Updated tool {name} (ID: {id})");
+                    println!("Updated tool {name} (ID: {})", terminal_safe(id));
                     verify::verify_tool_push(&name, &tool_config, &response);
                     changes_made = true;
                 }
                 Err(e) => {
-                    println!("Error processing {name}: {e}");
+                    println!("Error processing {name}: {}", terminal_safe(&e.to_string()));
                     failed += 1;
                 }
             },
@@ -465,7 +482,7 @@ fn handle_pull(matches: &clap::ArgMatches, ctx: &AppContext) -> Result<(), CliEr
 
     // Build the remote work list: (tool_id, name).
     let remote: Vec<(String, String)> = if let Some(tool) = &tool_filter {
-        println!("Pulling tool with ID: {tool}...");
+        println!("Pulling tool with ID: {}...", terminal_safe(tool));
         let details = api::get_tool(ctx, tool).map_err(|e| {
             CliError::Validation(format!("Failed to fetch tool with ID '{tool}': {e}"))
         })?;
@@ -476,7 +493,7 @@ fn handle_pull(matches: &clap::ArgMatches, ctx: &AppContext) -> Result<(), CliEr
             .and_then(Value::as_str)
             .ok_or_else(|| CliError::Validation(format!("Tool with ID '{tool}' has no name")))?
             .to_string();
-        println!("Found tool: {name}");
+        println!("Found tool: {}", terminal_safe(&name));
         vec![(id, name)]
     } else {
         println!("Pulling all tools from ElevenLabs...");
@@ -537,7 +554,9 @@ fn handle_pull(matches: &clap::ArgMatches, ctx: &AppContext) -> Result<(), CliEr
     let mut processed = 0;
     // Configs that couldn't be written; the rest are still registered.
     let mut failed = 0;
-    for (action, id, name, existing_idx) in &plan {
+    for (action, id, raw_name, existing_idx) in &plan {
+        let name = terminal_safe(raw_name);
+        let display_id = terminal_safe(id);
         if *action == PullAction::Skip {
             println!("⊘ Skipping '{name}' (already exists, use --update to overwrite)");
             continue;
@@ -548,7 +567,7 @@ fn handle_pull(matches: &clap::ArgMatches, ctx: &AppContext) -> Result<(), CliEr
             } else {
                 "pull"
             };
-            println!("[DRY RUN] Would {verb} tool: {name} (ID: {id})");
+            println!("[DRY RUN] Would {verb} tool: {name} (ID: {display_id})");
             continue;
         }
 
@@ -562,7 +581,10 @@ fn handle_pull(matches: &clap::ArgMatches, ctx: &AppContext) -> Result<(), CliEr
         let details = match api::get_tool(ctx, id) {
             Ok(v) => v,
             Err(e) => {
-                println!("  ✗ Error pulling tool '{name}': {e}");
+                println!(
+                    "  ✗ Error pulling tool '{name}': {}",
+                    terminal_safe(&e.to_string())
+                );
                 continue;
             }
         };
@@ -580,18 +602,27 @@ fn handle_pull(matches: &clap::ArgMatches, ctx: &AppContext) -> Result<(), CliEr
             Some(i) => {
                 let cfg_path = registry.tools[*i].config.clone();
                 if let Err(e) = project::write_config_in_project(&cfg_path, &tool_config) {
-                    println!("  ✗ Error saving '{name}': {e}");
+                    println!(
+                        "  ✗ Error saving '{name}': {}",
+                        terminal_safe(&e.to_string())
+                    );
                     failed += 1;
                     continue;
                 }
-                println!("  ✓ Updated '{name}' (config: {cfg_path})");
+                println!(
+                    "  ✓ Updated '{name}' (config: {})",
+                    terminal_safe(&cfg_path)
+                );
             }
             None => {
-                let cfg_path = project::generate_unique_filename(&output_dir, name, ".json")
+                let cfg_path = project::generate_unique_filename(&output_dir, raw_name, ".json")
                     .display()
                     .to_string();
                 if let Err(e) = project::write_config_in_project(&cfg_path, &tool_config) {
-                    println!("  ✗ Error saving '{name}': {e}");
+                    println!(
+                        "  ✗ Error saving '{name}': {}",
+                        terminal_safe(&e.to_string())
+                    );
                     failed += 1;
                     continue;
                 }
@@ -600,7 +631,11 @@ fn handle_pull(matches: &clap::ArgMatches, ctx: &AppContext) -> Result<(), CliEr
                     config: cfg_path.clone(),
                     id: Some(id.clone()),
                 });
-                println!("  ✓ Added '{name}' (config: {cfg_path}, type: {tool_type})");
+                println!(
+                    "  ✓ Added '{name}' (config: {}, type: {})",
+                    terminal_safe(&cfg_path),
+                    terminal_safe(&tool_type)
+                );
             }
         }
         processed += 1;

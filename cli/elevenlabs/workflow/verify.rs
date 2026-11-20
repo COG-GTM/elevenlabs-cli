@@ -13,6 +13,7 @@ use fern_cli_sdk::openapi::AppContext;
 use serde_json::{json, Map, Value};
 
 use super::api;
+use super::util::terminal_safe;
 
 /// Collect the key paths in `expected` that are missing from `actual`.
 ///
@@ -49,11 +50,12 @@ fn report_missing_fields(label: &str, missing: &[String], pull_command: &str) {
     }
     let shown = missing.len().min(10);
     println!(
-        "  ⚠ {label}: {} field(s) in the local config were not persisted by the API:",
+        "  ⚠ {}: {} field(s) in the local config were not persisted by the API:",
+        terminal_safe(label),
         missing.len()
     );
     for path in &missing[..shown] {
-        println!("      - {path}");
+        println!("      - {}", terminal_safe(path));
     }
     if missing.len() > shown {
         println!("      ... and {} more", missing.len() - shown);
@@ -74,7 +76,11 @@ pub fn verify_agent_push(
     let live = match api::get_agent(ctx, agent_id, branch_id) {
         Ok(live) => live,
         Err(e) => {
-            println!("  ⚠ {label}: could not verify the pushed config: {e}");
+            println!(
+                "  ⚠ {}: could not verify the pushed config: {}",
+                terminal_safe(label),
+                terminal_safe(&e.to_string())
+            );
             return;
         }
     };
@@ -113,7 +119,8 @@ pub fn verify_tool_push(label: &str, pushed_config: &Value, response: &Value) {
             report_missing_fields(label, &missing, "elevenlabs tools pull");
         }
         None => println!(
-            "  ⚠ {label}: could not verify the pushed config (no tool_config in the API response)"
+            "  ⚠ {}: could not verify the pushed config (no tool_config in the API response)",
+            terminal_safe(label)
         ),
     }
 }
