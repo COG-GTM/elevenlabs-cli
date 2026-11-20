@@ -696,15 +696,25 @@ impl LoginFlow for PkceLoginFlow {
     }
 }
 
-/// Bind a loopback TCP listener on the first available port in `candidate_ports` (tried in order).
-/// Pass `[0]` for an ephemeral (OS-assigned) port. Returns the bound listener, or an error naming
+/// Bind loopback TCP listeners on the first available port in `candidate_ports` (tried in order).
+/// Pass `[0]` for an ephemeral (OS-assigned) port. Returns the bound listeners, or an error naming
 /// every candidate when all are taken.
-async fn bind_loopback_listener(host: &str, candidate_ports: &[u16]) -> Result<TcpListener, CliError> {
+///
+/// Every address `host` stands for is bound on the same port: for `localhost` that is both
+/// 127.0.0.1 and [::1], since a browser may dial either. Binding only one would leave the other
+/// free for any local program to take, and the browser's callback would reach that program
+/// instead. A port where any of the addresses is taken is skipped for the next candidate.
+async fn bind_loopback_listener(host: &str, candidate_ports: &[u16]) -> Result<Vec<TcpListener>, CliError> {
     let mut last_err: Option<String> = None;
     for &port in candidate_ports {
-        match TcpListener::bind((host, port)).await {
-            Ok(listener) => return Ok(listener),
-            Err(e) => last_err = Some(e.to_string()),
+        // An ephemeral port is picked by the OS for the first address; if another program holds it
+        // on one of the other addresses, ask for a fresh one a few times.
+        let attempts = if port == 0 { 8 } else { 1 };
+        for _ in 0..attempts {
+            match bind_all_loopback_addrs(host, port).await {
+                Ok(listeners) => return Ok(listeners),
+                Err(e) => last_err = Some(e.to_string()),
+            }
         }
     }
     let ports = candidate_ports
@@ -716,6 +726,66 @@ async fn bind_loopback_listener(host: &str, candidate_ports: &[u16]) -> Result<T
         "Could not bind any {host} callback port [{ports}] — is another instance running, or did you forget to register these redirect URIs? ({})",
         last_err.unwrap_or_default()
     )))
+}
+
+/// The addresses a browser may dial for `host`, each with port 0 (filled in by the caller).
+async fn loopback_addrs(host: &str) -> std::io::Result<Vec<std::net::IpAddr>> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = bare.parse::<IpAddr>() {
+        return Ok(vec![ip]);
+    }
+    if bare.eq_ignore_ascii_case("localhost") {
+        return Ok(vec![IpAddr::V4(Ipv4Addr::LOCALHOST), IpAddr::V6(Ipv6Addr::LOCALHOST)]);
+    }
+    let mut ips = Vec::new();
+    for addr in tokio::net::lookup_host((bare, 0)).await? {
+        if !ips.contains(&addr.ip()) {
+            ips.push(addr.ip());
+        }
+    }
+    if ips.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("{host} did not resolve to any address"),
+        ));
+    }
+    Ok(ips)
+}
+
+/// Bind every address of `host` on `port`, or fail if any of them is taken. An address whose
+/// family this machine doesn't have at all (IPv6 turned off) is skipped: no browser dials it.
+async fn bind_all_loopback_addrs(host: &str, port: u16) -> std::io::Result<Vec<TcpListener>> {
+    let mut listeners: Vec<TcpListener> = Vec::new();
+    let mut missing = None;
+    let mut port = port;
+    for ip in loopback_addrs(host).await? {
+        match TcpListener::bind(std::net::SocketAddr::new(ip, port)).await {
+            Ok(listener) => {
+                if port == 0 {
+                    port = listener.local_addr()?.port();
+                }
+                listeners.push(listener);
+            }
+            Err(e) if loopback_family_missing(&e) => missing = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    match missing {
+        Some(e) if listeners.is_empty() => Err(e),
+        _ => Ok(listeners),
+    }
+}
+
+/// This machine has no such address or address family, as opposed to the port being taken.
+fn loopback_family_missing(e: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    const NO_FAMILY: i32 = libc::EAFNOSUPPORT;
+    #[cfg(windows)]
+    const NO_FAMILY: i32 = 10047; // WSAEAFNOSUPPORT
+    #[cfg(not(any(unix, windows)))]
+    const NO_FAMILY: i32 = -1;
+    e.kind() == std::io::ErrorKind::AddrNotAvailable || e.raw_os_error() == Some(NO_FAMILY)
 }
 
 async fn run_pkce(mut flow: PkceLoginFlow, ctx: LoginContext) -> Result<(), CliError> {
@@ -740,10 +810,11 @@ async fn run_pkce(mut flow: PkceLoginFlow, ctx: LoginContext) -> Result<(), CliE
     };
     let redirect_host = flow.redirect_host_str().to_string();
     let redirect_path = flow.redirect_path_str().to_string();
-    let listener = bind_loopback_listener(&redirect_host, &candidate_ports).await?;
+    let listeners = bind_loopback_listener(&redirect_host, &candidate_ports).await?;
     // Resolve the actually-bound port (the ephemeral one the OS chose, or the pinned one) and use
-    // it everywhere so the authorize request and token exchange carry the same redirect_uri.
-    let actual_port = listener
+    // it everywhere so the authorize request and token exchange carry the same redirect_uri. Every
+    // listener shares it.
+    let actual_port = listeners[0]
         .local_addr()
         .map_err(|e| CliError::Auth(format!("could not resolve loopback callback port: {e}")))?
         .port();
@@ -767,7 +838,7 @@ async fn run_pkce(mut flow: PkceLoginFlow, ctx: LoginContext) -> Result<(), CliE
     // Wait for the browser to hit /callback with code+state. The listener checks the `state` it
     // received against the one we sent, but answers the browser only for a callback it rejects —
     // a usable one comes back still connected, via the responder.
-    let (code, responder) = match accept_callback(&listener, &redirect_path, &state, flow.callback_pages()).await {
+    let (code, responder) = match accept_callback(&listeners, &redirect_path, &state, flow.callback_pages()).await {
         Ok(v) => v,
         Err(e) => return Err(e),
     };
@@ -923,21 +994,24 @@ const POST_CALLBACK_FAILURE_DESCRIPTION: &str = "The CLI could not complete the 
 /// surfacing a clear timeout beats hanging silently.
 const PKCE_CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Accept one HTTP request on the loopback listener, parse `?code=…&state=…` from the request
-/// line, and check `state` against `expected_state`. A callback we can't use is answered here and
-/// returns an error; a usable one returns the code plus the still-open connection, so the caller
-/// answers the browser once it knows whether the login actually worked.
+/// Wait on the loopback listeners for this login's callback, parse `?code=…&state=…` from the
+/// request line, and check `state` against `expected_state`. A callback without this login's
+/// `state` (another login's tab, or any page or program that can reach the port) is answered with
+/// the failure page and the wait goes on, so it can't end the login. A callback with this login's
+/// `state` carrying an `error`, or missing its `code`, is answered here and returns an error; a
+/// usable one returns the code plus the still-open connection, so the caller answers the browser
+/// once it knows whether the login actually worked.
 async fn accept_callback<'a>(
-    listener: &TcpListener,
+    listeners: &[TcpListener],
     expected_path: &str,
     expected_state: &str,
     pages: CallbackPages<'a>,
 ) -> Result<(String, CallbackResponder<'a>), CliError> {
-    accept_callback_with_timeout(listener, expected_path, expected_state, pages, PKCE_CALLBACK_TIMEOUT).await
+    accept_callback_with_timeout(listeners, expected_path, expected_state, pages, PKCE_CALLBACK_TIMEOUT).await
 }
 
 async fn accept_callback_with_timeout<'a>(
-    listener: &TcpListener,
+    listeners: &[TcpListener],
     expected_path: &str,
     expected_state: &str,
     pages: CallbackPages<'a>,
@@ -945,7 +1019,7 @@ async fn accept_callback_with_timeout<'a>(
 ) -> Result<(String, CallbackResponder<'a>), CliError> {
     match tokio::time::timeout(
         timeout,
-        accept_callback_inner(listener, expected_path, expected_state, pages),
+        accept_callback_inner(listeners, expected_path, expected_state, pages),
     )
     .await
     {
@@ -959,110 +1033,171 @@ async fn accept_callback_with_timeout<'a>(
     }
 }
 
+/// How long one loopback connection may take to send its request line and headers. Each connection
+/// is read on its own, so a slow or silent one holds up nothing else.
+const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Most of a request head the listener keeps; the rest is read and dropped.
+const CALLBACK_MAX_REQUEST_HEAD: usize = 8 * 1024;
+
 async fn accept_callback_inner<'a>(
-    listener: &TcpListener,
+    listeners: &[TcpListener],
     expected_path: &str,
     expected_state: &str,
     pages: CallbackPages<'a>,
 ) -> Result<(String, CallbackResponder<'a>), CliError> {
-    // Single-shot accept. If the browser hits us with a noisy preflight
-    // (favicon, etc.) we skip and accept the next; cap at 8 attempts.
-    for _ in 0..8 {
-        let (mut socket, _) = listener
-            .accept()
-            .await
-            .map_err(|e| CliError::Auth(format!("accept on loopback failed: {e}")))?;
-
-        let mut buf = [0u8; 8192];
-        let n = socket
-            .read(&mut buf)
-            .await
-            .map_err(|e| CliError::Auth(format!("read from loopback failed: {e}")))?;
-        if n == 0 {
-            continue;
-        }
-        let req = String::from_utf8_lossy(&buf[..n]);
-        let path = match parse_request_path(&req) {
-            Some(p) => p,
-            None => continue,
-        };
-        // Match the configured callback path exactly (query string stripped). The listener must
-        // serve whatever path the redirect URI advertised — defaulting to `/callback`, but honoring
-        // a custom registered path — otherwise the browser callback 404s and login hangs. Anything
-        // else (favicon.ico, /.well-known, stray probes) is skipped.
-        let path_only = path.split('?').next().unwrap_or(path);
-        if path_only != expected_path {
-            let _ = write_response(&mut socket, 404, "not found").await;
-            continue;
-        }
-
-        // Parse query.
-        let qs = path.split_once('?').map(|(_, q)| q).unwrap_or("");
-        let mut code = None;
-        let mut state = None;
-        let mut error_param = None;
-        let mut error_description = None;
-        for (k, v) in form_urlencoded::parse(qs.as_bytes()) {
-            match k.as_ref() {
-                "code" => code = Some(v.into_owned()),
-                "state" => state = Some(v.into_owned()),
-                "error" => error_param = Some(v.into_owned()),
-                "error_description" => error_description = Some(v.into_owned()),
-                _ => {}
+    // Connections still sending their request. Dropped (and so aborted) on return.
+    let mut reading: tokio::task::JoinSet<Option<(String, tokio::net::TcpStream)>> = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            accepted = accept_any(listeners) => {
+                match accepted {
+                    Ok(mut socket) => {
+                        reading.spawn(async move {
+                            let target = read_request_target(&mut socket).await?;
+                            Some((target, socket))
+                        });
+                    }
+                    // Out of file handles, say: try again shortly. The overall timeout bounds this.
+                    Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+                }
+            }
+            Some(read) = reading.join_next(), if !reading.is_empty() => {
+                let Ok(Some((target, socket))) = read else { continue };
+                if let Some(result) = handle_callback_request(socket, &target, expected_path, expected_state, pages).await {
+                    return result;
+                }
             }
         }
-
-        if let Some(e) = error_param {
-            write_failure(&mut socket, &pages, &e, error_description.as_deref()).await;
-            return Err(CliError::Auth(match error_description {
-                Some(description) => format!("Authorization server returned error: {e} ({description})"),
-                None => format!("Authorization server returned error: {e}"),
-            }));
-        }
-
-        let (code, state) = match (code, state) {
-            (Some(code), Some(state)) => (code, state),
-            (code, _) => {
-                // No `error` from the authorization server, but the callback is unusable. Synthesize
-                // the OAuth error code for it so a hosted error page always has something to render.
-                let missing = if code.is_none() { "code" } else { "state" };
-                write_failure(
-                    &mut socket,
-                    &pages,
-                    "invalid_request",
-                    Some(&format!("The callback was missing its `{missing}` parameter.")),
-                )
-                .await;
-                return Err(CliError::Auth(format!(
-                    "callback missing `{missing}` query parameter"
-                )));
-            }
-        };
-
-        if state != expected_state {
-            // Possible CSRF. The browser gets the failure page like any other unusable callback —
-            // telling it "you're all set" for a callback we're about to reject would be a lie, and
-            // on a configured page a branded one. Neither state value is forwarded: the one we sent
-            // is a per-login nonce and has no business leaving the loopback.
-            write_failure(
-                &mut socket,
-                &pages,
-                "invalid_request",
-                Some("The callback `state` parameter did not match the one the CLI sent."),
-            )
-            .await;
-            return Err(CliError::Auth(format!(
-                "OAuth state mismatch (expected `{expected_state}`, got `{state}`) — possible CSRF; aborting"
-            )));
-        }
-
-        // A usable callback. The browser stays connected and unanswered until the caller has
-        // exchanged the code and stored the credential.
-        return Ok((code, CallbackResponder { socket, pages }));
     }
-    Err(CliError::Auth(
-        "Too many invalid requests on the loopback listener; giving up".to_string(),
-    ))
+}
+
+/// Accept the next connection on whichever listener has one.
+async fn accept_any(listeners: &[TcpListener]) -> std::io::Result<tokio::net::TcpStream> {
+    std::future::poll_fn(|cx| {
+        for listener in listeners {
+            if let std::task::Poll::Ready(accepted) = listener.poll_accept(cx) {
+                return std::task::Poll::Ready(accepted.map(|(socket, _)| socket));
+            }
+        }
+        std::task::Poll::Pending
+    })
+    .await
+}
+
+/// The request target of the connection's first line, or `None` when no request arrives within
+/// [`CALLBACK_READ_TIMEOUT`]. The headers are read to their end: closing a connection with some
+/// still unread resets it, and the browser can lose the response.
+async fn read_request_target(socket: &mut tokio::net::TcpStream) -> Option<String> {
+    let read = async {
+        let mut head = Vec::new();
+        // The last bytes read, to find the blank line across reads.
+        let mut tail = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = socket.read(&mut chunk).await.ok()?;
+            if n == 0 {
+                break;
+            }
+            let room = CALLBACK_MAX_REQUEST_HEAD - head.len().min(CALLBACK_MAX_REQUEST_HEAD);
+            head.extend_from_slice(&chunk[..n.min(room)]);
+            tail.extend_from_slice(&chunk[..n]);
+            if tail.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+            tail.drain(..tail.len().saturating_sub(3));
+        }
+        Some(head)
+    };
+    let head = tokio::time::timeout(CALLBACK_READ_TIMEOUT, read).await.ok()??;
+    let req = String::from_utf8_lossy(&head);
+    parse_request_path(&req).map(str::to_string)
+}
+
+/// Answer one request on the loopback listener. `None` means keep waiting; `Some` ends the wait
+/// with the login's callback or its error.
+async fn handle_callback_request<'a>(
+    mut socket: tokio::net::TcpStream,
+    path: &str,
+    expected_path: &str,
+    expected_state: &str,
+    pages: CallbackPages<'a>,
+) -> Option<Result<(String, CallbackResponder<'a>), CliError>> {
+    // Match the configured callback path exactly (query string stripped). The listener must
+    // serve whatever path the redirect URI advertised — defaulting to `/callback`, but honoring
+    // a custom registered path — otherwise the browser callback 404s and login hangs. Anything
+    // else (favicon.ico, /.well-known, stray probes) is skipped.
+    let path_only = path.split('?').next().unwrap_or(path);
+    if path_only != expected_path {
+        let _ = write_response(&mut socket, 404, "not found").await;
+        return None;
+    }
+
+    // Parse query.
+    let qs = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+    let mut code = None;
+    let mut state = None;
+    let mut error_param = None;
+    let mut error_description = None;
+    for (k, v) in form_urlencoded::parse(qs.as_bytes()) {
+        match k.as_ref() {
+            "code" => code = Some(v.into_owned()),
+            "state" => state = Some(v.into_owned()),
+            "error" => error_param = Some(v.into_owned()),
+            "error_description" => error_description = Some(v.into_owned()),
+            _ => {}
+        }
+    }
+
+    // Only the authorization server knows this login's `state`, and it sends it back on every
+    // redirect, error ones included (RFC 6749 §4.1.2.1). A callback without it came from somewhere
+    // else — a tab left open by an earlier login, or any page or local program that can reach the
+    // port — so it is answered with the failure page and the wait goes on: it can't end the login.
+    // Neither state value is forwarded: the one we sent is a per-login nonce and has no business
+    // leaving the loopback.
+    if state.as_deref() != Some(expected_state) {
+        let description = if state.is_none() {
+            "The callback was missing its `state` parameter.".to_string()
+        } else {
+            "The callback `state` parameter did not match the one the CLI sent.".to_string()
+        };
+        write_failure(&mut socket, &pages, "invalid_request", Some(&description)).await;
+        {
+            use std::io::Write;
+            let mut err = std::io::stderr().lock();
+            let _ = writeln!(
+                err,
+                "Ignored a callback that isn't from this login ({}); still waiting.",
+                if state.is_none() { "no `state`" } else { "`state` mismatch, possible CSRF" }
+            );
+        }
+        return None;
+    }
+
+    if let Some(e) = error_param {
+        write_failure(&mut socket, &pages, &e, error_description.as_deref()).await;
+        return Some(Err(CliError::Auth(match error_description {
+            Some(description) => format!("Authorization server returned error: {e} ({description})"),
+            None => format!("Authorization server returned error: {e}"),
+        })));
+    }
+
+    let Some(code) = code else {
+        // No `error` from the authorization server, but the callback is unusable. Synthesize the
+        // OAuth error code for it so a hosted error page always has something to render.
+        write_failure(
+            &mut socket,
+            &pages,
+            "invalid_request",
+            Some("The callback was missing its `code` parameter."),
+        )
+        .await;
+        return Some(Err(CliError::Auth("callback missing `code` query parameter".to_string())));
+    };
+
+    // A usable callback. The browser stays connected and unanswered until the caller has
+    // exchanged the code and stored the credential.
+    Some(Ok((code, CallbackResponder { socket, pages })))
 }
 
 fn parse_request_path(req: &str) -> Option<&str> {
@@ -2019,9 +2154,10 @@ mod tests {
             l.local_addr().unwrap().port() // freed when `l` drops at end of block
         };
 
-        let listener = bind_loopback_listener("127.0.0.1", &[taken, free]).await.unwrap();
+        let listeners = bind_loopback_listener("127.0.0.1", &[taken, free]).await.unwrap();
+        assert_eq!(listeners.len(), 1, "a literal IP is the only address to bind");
         assert_eq!(
-            listener.local_addr().unwrap().port(),
+            listeners[0].local_addr().unwrap().port(),
             free,
             "should skip the occupied port and bind the next free one"
         );
@@ -2060,8 +2196,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn bind_loopback_listener_binds_localhost() {
         // localhost must be a bindable loopback host (resolves to 127.0.0.1 or ::1 on the same box).
-        let listener = bind_loopback_listener("localhost", &[0]).await.unwrap();
-        assert_ne!(listener.local_addr().unwrap().port(), 0);
+        let listeners = bind_loopback_listener("localhost", &[0]).await.unwrap();
+        let port = listeners[0].local_addr().unwrap().port();
+        assert_ne!(port, 0);
+        assert!(
+            listeners.iter().all(|l| l.local_addr().unwrap().port() == port),
+            "every loopback address must share the one port the redirect URI names"
+        );
     }
 
     #[test]
@@ -2142,7 +2283,8 @@ mod tests {
         expected_state: &str,
         pages: CallbackPages<'_>,
     ) -> Result<String, CliError> {
-        let (code, responder) = accept_callback(listener, expected_path, expected_state, pages).await?;
+        let (code, responder) =
+            accept_callback(std::slice::from_ref(listener), expected_path, expected_state, pages).await?;
         responder.success().await;
         Ok(code)
     }
@@ -2154,7 +2296,8 @@ mod tests {
         expected_state: &str,
         pages: CallbackPages<'_>,
     ) -> Result<String, CliError> {
-        let (code, responder) = accept_callback(listener, expected_path, expected_state, pages).await?;
+        let (code, responder) =
+            accept_callback(std::slice::from_ref(listener), expected_path, expected_state, pages).await?;
         responder
             .failure("server_error", Some(POST_CALLBACK_FAILURE_DESCRIPTION))
             .await;
@@ -2171,7 +2314,7 @@ mod tests {
         let port = pick_free_port();
         let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
         let err = accept_callback_with_timeout(
-            &listener,
+            std::slice::from_ref(&listener),
             "/callback",
             "state-xyz",
             CallbackPages::default(),
@@ -2261,7 +2404,7 @@ mod tests {
                 .await
         });
 
-        let (code, responder) = accept_callback(&listener, "/callback", "s", CallbackPages::default())
+        let (code, responder) = accept_callback(std::slice::from_ref(&listener), "/callback", "s", CallbackPages::default())
             .await
             .expect("valid callback");
         assert_eq!(code, "c");
@@ -2399,7 +2542,7 @@ mod tests {
             .build()
             .unwrap()
             .get(format!(
-                "http://127.0.0.1:{port}/callback?error=access_denied&error_description=User%20denied%20the%20request"
+                "http://127.0.0.1:{port}/callback?error=access_denied&error_description=User%20denied%20the%20request&state=state-xyz"
             ))
             .send()
             .await
@@ -2426,7 +2569,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let resp = reqwest::Client::new()
             .get(format!(
-                "http://127.0.0.1:{port}/callback?error=access_denied&error_description=%3Cscript%3Ealert(1)%3C/script%3E"
+                "http://127.0.0.1:{port}/callback?error=access_denied&error_description=%3Cscript%3Ealert(1)%3C/script%3E&state=state-xyz"
             ))
             .send()
             .await
@@ -2470,7 +2613,13 @@ mod tests {
             "https://acme.com/cli/error?error=invalid_request\
              &error_description=The+callback+was+missing+its+%60state%60+parameter."
         );
-        assert!(acceptor.await.unwrap().is_err());
+        // Without this login's `state` the callback can't be from the authorization server, so it
+        // doesn't end the login: the genuine one that follows still completes it.
+        assert!(!acceptor.is_finished());
+        let _ = reqwest::get(format!("http://127.0.0.1:{port}/callback?code=c&state=state-xyz"))
+            .await
+            .unwrap();
+        assert_eq!(acceptor.await.unwrap().unwrap(), "c");
     }
 
     #[test]
@@ -2520,7 +2669,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let _ = reqwest::Client::new()
             .get(format!(
-                "http://127.0.0.1:{port}/callback?error=access_denied&error_description=user+denied"
+                "http://127.0.0.1:{port}/callback?error=access_denied&error_description=user+denied&state=state-xyz"
             ))
             .send()
             .await
@@ -2589,10 +2738,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
-    async fn pkce_state_mismatch_aborts_and_serves_the_failure_page() {
-        // A callback carrying a state we never issued is a possible CSRF. The listener must fail
-        // the login *and* answer the browser with the failure page — the success page is written
-        // only after this check passes.
+    async fn pkce_state_mismatch_serves_the_failure_page_and_keeps_waiting() {
+        // A callback carrying a state we never issued is a possible CSRF. The listener must answer
+        // the browser with the failure page — the success page is written only after this check
+        // passes — and keep waiting, so a forged callback can't end the login either.
         let port = pick_free_port();
         let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
         let acceptor = tokio::spawn(async move {
@@ -2612,8 +2761,11 @@ mod tests {
         let body = resp.text().await.unwrap();
         assert!(body.contains("Authorization didn't complete"), "{body}");
         assert!(!body.contains("You're all set"), "{body}");
-        let err = format!("{}", acceptor.await.unwrap().expect_err("state mismatch must fail"));
-        assert!(err.contains("possible CSRF"), "{err}");
+        assert!(!acceptor.is_finished(), "a forged callback must not end the login");
+        let _ = reqwest::get(format!("http://127.0.0.1:{port}/callback?code=real&state=expected-state"))
+            .await
+            .unwrap();
+        assert_eq!(acceptor.await.unwrap().unwrap(), "real");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2650,7 +2802,157 @@ mod tests {
         );
         assert!(!location.contains("expected-state"), "{location}");
         assert!(!location.contains("attacker-state"), "{location}");
-        assert!(acceptor.await.unwrap().is_err());
+        assert!(!acceptor.is_finished(), "a forged callback must not end the login");
+        acceptor.abort();
+    }
+
+
+    /// Without an IPv6 loopback (some containers) the dual-stack tests can't run.
+    fn no_ipv6_loopback() -> bool {
+        let missing = std::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)).is_err();
+        if missing {
+            eprintln!("skipped: no IPv6 loopback here");
+        }
+        missing
+    }
+
+    /// Send `target` to the listener and read the response, the way a page or local program would.
+    async fn raw_request(addr: std::net::SocketAddr, target: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(format!("GET {target} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut response = String::new();
+        let _ = stream.read_to_string(&mut response).await;
+        response
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bind_loopback_listener_takes_both_loopback_addresses_for_localhost() {
+        // `localhost` may be dialed as 127.0.0.1 or [::1]. Leaving either free lets another
+        // program listen there and receive the browser's callback instead of the CLI.
+        if no_ipv6_loopback() {
+            return;
+        }
+        let listeners = bind_loopback_listener("localhost", &[0]).await.unwrap();
+        let port = listeners[0].local_addr().unwrap().port();
+        assert_eq!(listeners.len(), 2, "both 127.0.0.1 and [::1] must be bound");
+        assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_err(), "127.0.0.1:{port} left free");
+        assert!(
+            std::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)).is_err(),
+            "[::1]:{port} left free"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bind_loopback_listener_skips_a_port_held_on_the_other_loopback_address() {
+        // Another program holding only [::1] on the first port would get the browser's callback
+        // whenever the browser dials [::1]; that port must be skipped for the next candidate.
+        if no_ipv6_loopback() {
+            return;
+        }
+        let squatter = std::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)).unwrap();
+        let held = squatter.local_addr().unwrap().port();
+        let free = loop {
+            let p = pick_free_port();
+            if p != held && std::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, p)).is_ok() {
+                break p;
+            }
+        };
+        let listeners = bind_loopback_listener("localhost", &[held, free]).await.unwrap();
+        assert!(
+            listeners.iter().all(|l| l.local_addr().unwrap().port() == free),
+            "should skip port {held}, held on [::1], for {free}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pkce_loopback_stray_callbacks_do_not_end_the_login() {
+        // Any page or local program that can reach the fixed callback port may send callbacks
+        // without knowing this login's `state`. None of them may end the login: the genuine
+        // callback that follows must still complete it.
+        let listeners = bind_loopback_listener("localhost", &[0]).await.unwrap();
+        let addrs: Vec<_> = listeners.iter().map(|l| l.local_addr().unwrap()).collect();
+        let acceptor = tokio::spawn(async move {
+            let (code, responder) =
+                accept_callback(&listeners, "/callback", "the-state", CallbackPages::default()).await?;
+            responder.success().await;
+            Ok::<_, CliError>(code)
+        });
+
+        for addr in &addrs {
+            for target in [
+                "/callback?error=x",
+                "/callback?error=access_denied&state=wrong",
+                "/callback?code=a&state=wrong",
+                "/callback?code=a",
+                "/callback",
+            ] {
+                let response = raw_request(*addr, target).await;
+                assert!(response.starts_with("HTTP/1.1 400"), "{target}: {response}");
+                assert!(!response.contains("the-state"), "{target}: {response}");
+            }
+            // More than the old cap of eight non-callback requests.
+            for _ in 0..12 {
+                let response = raw_request(*addr, "/favicon.ico").await;
+                assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+            }
+        }
+        assert!(!acceptor.is_finished(), "a stray request ended the login");
+
+        let response = raw_request(addrs[addrs.len() - 1], "/callback?code=genuine&state=the-state").await;
+        assert!(response.contains("You're all set"), "{response}");
+        assert_eq!(acceptor.await.unwrap().unwrap(), "genuine");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pkce_loopback_error_without_this_logins_state_is_ignored_but_with_it_is_final() {
+        let listeners = bind_loopback_listener("127.0.0.1", &[0]).await.unwrap();
+        let addr = listeners[0].local_addr().unwrap();
+        let acceptor = tokio::spawn(async move {
+            accept_callback(&listeners, "/callback", "s", CallbackPages::default())
+                .await
+                .map(|(code, _responder)| code)
+        });
+        raw_request(addr, "/callback?error=access_denied").await;
+        assert!(!acceptor.is_finished());
+        raw_request(addr, "/callback?error=access_denied&state=s").await;
+        let err = format!("{}", acceptor.await.unwrap().unwrap_err());
+        assert!(err.contains("access_denied"), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pkce_loopback_idle_connection_does_not_block_the_callback() {
+        // A connection that never sends a request must not hold up the browser's callback. The
+        // overall wait is capped well under the per-connection read timeout, so this fails if the
+        // listener waits on the idle connection before accepting the next.
+        let listeners = bind_loopback_listener("localhost", &[0]).await.unwrap();
+        let addr = listeners[0].local_addr().unwrap();
+        let acceptor = tokio::spawn(async move {
+            accept_callback_with_timeout(
+                &listeners,
+                "/callback",
+                "the-state",
+                CallbackPages::default(),
+                Duration::from_secs(3),
+            )
+            .await
+        });
+        let _idle = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let _half = {
+            use tokio::io::AsyncWriteExt;
+            let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+            s.write_all(b"GET /callback?code=x&state=the-state HTTP/1.1\r\n").await.unwrap();
+            s
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let browser = tokio::spawn(raw_request(addr, "/callback?code=genuine&state=the-state"));
+        let (code, responder) = acceptor.await.unwrap().expect("idle connection blocked the callback");
+        assert_eq!(code, "genuine");
+        responder.success().await;
+        assert!(browser.await.unwrap().contains("You're all set"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
