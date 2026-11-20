@@ -17,6 +17,16 @@ name: Release
 permissions:
   "contents": "write"
 
+# dist is installed from files whose SHA-256 is pinned here, never by piping a
+# download straight into a shell. Bumping cargo-dist-version means updating all
+# three values from the new release's cargo-dist-installer.sh and sha256.sum.
+# The shell installer embeds and verifies the checksum of the archive it
+# fetches, so pinning the installer pins the binary too.
+env:
+  DIST_VERSION: "0.31.0"
+  DIST_INSTALLER_SH_SHA256: "e79d87e418b9d2cbe992d014985457c28a5a7c553add3da4ed1047e161c928f4"
+  DIST_WINDOWS_ZIP_SHA256: "a14e17557b269b101405e0cc6b647581d56313c954a51c7fddd423bba21e17b2"
+
 # This task will run whenever you push a git tag that looks like a version
 # like "1.0.0", "v0.1.0-prerelease.1", "my-app/0.1.0", "releases/v1.0.0", etc.
 # Various formats will be parsed into a VERSION and an optional PACKAGE_NAME, where
@@ -53,20 +63,30 @@ jobs:
       tag: ${{ !github.event.pull_request && github.ref_name || '' }}
       tag-flag: ${{ !github.event.pull_request && format('--tag={0}', github.ref_name) || '' }}
       publishing: ${{ !github.event.pull_request }}
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
           submodules: recursive
       - name: Install dist
-        # we specify bash to get pipefail; it guards against the `curl` command
-        # failing. otherwise `sh` won't catch that `curl` returned non-0
         shell: bash
-        run: "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh | sh"
+        run: |
+          set -euo pipefail
+          installer="$RUNNER_TEMP/cargo-dist-installer.sh"
+          curl --proto '=https' --tlsv1.2 -LsSf --retry 5 --retry-delay 5 --retry-all-errors \
+            -o "$installer" "https://github.com/axodotdev/cargo-dist/releases/download/v${DIST_VERSION}/cargo-dist-installer.sh"
+          if command -v sha256sum > /dev/null 2>&1; then
+            actual=$(sha256sum "$installer" | cut -d' ' -f1)
+          else
+            actual=$(shasum -a 256 "$installer" | cut -d' ' -f1)
+          fi
+          if [ "$actual" != "$DIST_INSTALLER_SH_SHA256" ]; then
+            echo "::error::cargo-dist-installer.sh SHA-256 is $actual, expected $DIST_INSTALLER_SH_SHA256. Refusing to run it."
+            exit 1
+          fi
+          sh "$installer"
       - name: Cache dist
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: cargo-dist-cache
           path: ~/.cargo/bin/dist
@@ -76,13 +96,15 @@ jobs:
       # (PRs run on the *source* but secrets are usually on the *target* -- that's *good*
       # but also really annoying to build CI around when it needs secrets to work right.)
       - id: plan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           dist ${{ (!github.event.pull_request && format('host --steps=create --tag={0}', github.ref_name)) || 'plan' }} --output-format=json > plan-dist-manifest.json
           echo "dist ran successfully"
           cat plan-dist-manifest.json
           echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
       - name: "Upload dist-manifest.json"
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: artifacts-plan-dist-manifest
           path: plan-dist-manifest.json
@@ -110,7 +132,6 @@ jobs:
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.container && matrix.container.image || null }}
     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
     permissions:
       "attestations": "write"
@@ -120,52 +141,76 @@ jobs:
       - name: enable windows longpaths
         run: |
           git config --global core.longpaths true
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
           submodules: recursive
-      - name: Install Rust non-interactively if not already installed
+      # dist only builds in a container for cross targets this workspace does
+      # not ship. Should one be added, use an image with Rust preinstalled
+      # rather than piping an unpinned rustup script into a shell here.
+      - name: Require Rust in the build container
         if: ${{ matrix.container }}
+        env:
+          CONTAINER_IMAGE: ${{ matrix.container.image }}
         run: |
           if ! command -v cargo > /dev/null 2>&1; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-            echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+            echo "::error::The build container $CONTAINER_IMAGE has no cargo. Use an image with Rust preinstalled."
+            exit 1
           fi
+      # Replaces dist's generated `curl | sh` / `irm | iex` from
+      # matrix.install_dist with downloads checked against the pinned SHA-256
+      # values in the workflow env. curl retries cover the transient download
+      # failures that used to leave `dist` missing on 2 of 3 releases.
       - name: Install dist
-        run: ${{ matrix.install_dist.run }}
-      # cargo-dist guards the installer download with pipefail in the `plan`
-      # job but not here, where the same `curl ... | sh` runs once per matrix
-      # leg. A dead curl pipes nothing into `sh`, which exits 0, so the step
-      # above reports success and `dist build` fails two steps later with an
-      # opaque exit 127. Observed on 2 of 3 real releases.
-      #
-      # Deliberately does not branch on `matrix.install_dist.shell`: steps 1
-      # and 3 reuse the matrix's own command and shell exactly as upstream
-      # does, so this can only ever add a retry — it cannot mis-route a leg
-      # and skip the install entirely.
-      - id: dist-check
-        name: Check dist installed
+        if: ${{ runner.os != 'Windows' }}
         shell: bash
         run: |
-          if dist --version > /dev/null 2>&1; then
-            echo "ok=yes" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          installer="$RUNNER_TEMP/cargo-dist-installer.sh"
+          curl --proto '=https' --tlsv1.2 -LsSf --retry 5 --retry-delay 5 --retry-all-errors \
+            -o "$installer" "https://github.com/axodotdev/cargo-dist/releases/download/v${DIST_VERSION}/cargo-dist-installer.sh"
+          if command -v sha256sum > /dev/null 2>&1; then
+            actual=$(sha256sum "$installer" | cut -d' ' -f1)
           else
-            echo "ok=no" >> "$GITHUB_OUTPUT"
-            echo "::warning::The dist installer did not put 'dist' on PATH — most likely a transient download failure. Retrying."
+            actual=$(shasum -a 256 "$installer" | cut -d' ' -f1)
           fi
-      - name: Install dist (retry)
-        if: ${{ steps.dist-check.outputs.ok == 'no' }}
-        run: ${{ matrix.install_dist.run }}
+          if [ "$actual" != "$DIST_INSTALLER_SH_SHA256" ]; then
+            echo "::error::cargo-dist-installer.sh SHA-256 is $actual, expected $DIST_INSTALLER_SH_SHA256. Refusing to run it."
+            exit 1
+          fi
+          sh "$installer"
+      # The PowerShell installer does not verify what it downloads, so fetch
+      # the archive directly and check it against the release's sha256.sum.
+      - name: Install dist (Windows)
+        if: ${{ runner.os == 'Windows' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = Join-Path $env:RUNNER_TEMP 'cargo-dist.zip'
+          $url = "https://github.com/axodotdev/cargo-dist/releases/download/v$($env:DIST_VERSION)/cargo-dist-x86_64-pc-windows-msvc.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip -MaximumRetryCount 5 -RetryIntervalSec 5
+          $actual = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash.ToLowerInvariant()
+          if ($actual -ne $env:DIST_WINDOWS_ZIP_SHA256) {
+            Write-Output "::error::cargo-dist Windows archive SHA-256 is $actual, expected $($env:DIST_WINDOWS_ZIP_SHA256). Refusing to install it."
+            exit 1
+          }
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $HOME '.cargo' }
+          $bin = Join-Path $cargoHome 'bin'
+          $unpacked = Join-Path $env:RUNNER_TEMP 'cargo-dist'
+          Expand-Archive -Path $zip -DestinationPath $unpacked -Force
+          New-Item -ItemType Directory -Force -Path $bin | Out-Null
+          Copy-Item (Join-Path $unpacked 'dist.exe') $bin -Force
+          Add-Content -Path $env:GITHUB_PATH -Value $bin
       - name: Verify dist
         shell: bash
         run: |
           dist --version || {
-            echo "::error::The cargo-dist installer failed twice on this runner, so 'dist' is not available. This is usually a transient network failure downloading https://github.com/axodotdev/cargo-dist/releases — re-run this job."
+            echo "::error::'dist' is not available after installing it. This is usually a transient network failure downloading https://github.com/axodotdev/cargo-dist/releases — re-run this job."
             exit 1
           }
       # Get the dist-manifest
       - name: Fetch local artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           pattern: artifacts-*
           path: target/distrib/
@@ -174,12 +219,14 @@ jobs:
         run: |
           ${{ matrix.packages_install }}
       - name: Build artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Actually do builds and make zips and whatnot
           dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
       - name: Attest
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
         with:
           subject-path: "target/distrib/*${{ join(matrix.targets, ', ') }}*"
       - id: cargo-dist
@@ -196,7 +243,7 @@ jobs:
 
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
       - name: "Upload artifacts"
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: artifacts-build-local-${{ join(matrix.targets, '_') }}
           path: |
@@ -210,28 +257,29 @@ jobs:
       - build-local-artifacts
     runs-on: "ubuntu-22.04"
     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
           submodules: recursive
       - name: Install cached dist
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: cargo-dist-cache
           path: ~/.cargo/bin/
       - run: chmod +x ~/.cargo/bin/dist
       # Get all the local artifacts for the global tasks to use (for e.g. checksums)
       - name: Fetch local artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           pattern: artifacts-*
           path: target/distrib/
           merge-multiple: true
       - id: cargo-dist
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           dist build ${{ needs.plan.outputs.tag-flag }} --output-format=json "--artifacts=global" > dist-manifest.json
           echo "dist ran successfully"
@@ -243,7 +291,7 @@ jobs:
 
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
       - name: "Upload artifacts"
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: artifacts-build-global
           path: |
@@ -258,45 +306,45 @@ jobs:
       - build-global-artifacts
     # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
     if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     runs-on: "ubuntu-22.04"
     outputs:
       val: ${{ steps.host.outputs.manifest }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
           submodules: recursive
       - name: Install cached dist
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: cargo-dist-cache
           path: ~/.cargo/bin/
       - run: chmod +x ~/.cargo/bin/dist
       # Fetch artifacts from scratch-storage
       - name: Fetch artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           pattern: artifacts-*
           path: target/distrib/
           merge-multiple: true
       - id: host
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           dist host ${{ needs.plan.outputs.tag-flag }} --steps=upload --steps=release --output-format=json > dist-manifest.json
           echo "artifacts uploaded and released successfully"
           cat dist-manifest.json
           echo "manifest=$(jq -c "." dist-manifest.json)" >> "$GITHUB_OUTPUT"
       - name: "Upload dist-manifest.json"
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           # Overwrite the previous copy
           name: artifacts-dist-manifest
           path: dist-manifest.json
       # Create a GitHub Release while uploading all files to it
       - name: "Download GitHub Artifacts"
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           pattern: artifacts-*
           path: artifacts
@@ -307,6 +355,7 @@ jobs:
           rm -f artifacts/*-dist-manifest.json
       - name: Create GitHub Release
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
           ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"
           ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
@@ -398,13 +447,13 @@ jobs:
     steps:
       - name: Mint a tap token
         id: app-token
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
         with:
           app-id: ${{ secrets.PUBLISH_APP_ID }}
           private-key: ${{ secrets.PUBLISH_APP_PRIVATE_KEY }}
           owner: elevenlabs
           repositories: homebrew-tap
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: "elevenlabs/homebrew-tap"
           token: ${{ steps.app-token.outputs.token }}
@@ -414,13 +463,13 @@ jobs:
           fetch-depth: 1
       # So we have access to "dist"
       - name: Install cached dist
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: cargo-dist-cache
           path: ~/.cargo/bin/
       - run: chmod +x ~/.cargo/bin/dist
       - name: Fetch homebrew formulae
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           pattern: artifacts-*
           path: Formula/
@@ -546,7 +595,7 @@ jobs:
 
       - name: Mint a bucket token
         id: app-token
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
         with:
           app-id: ${{ secrets.PUBLISH_APP_ID }}
           private-key: ${{ secrets.PUBLISH_APP_PRIVATE_KEY }}
@@ -554,7 +603,7 @@ jobs:
           repositories: scoop-bucket
 
       - name: Check out the Scoop bucket
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: "elevenlabs/scoop-bucket"
           token: ${{ steps.app-token.outputs.token }}
@@ -619,10 +668,8 @@ jobs:
     # "host" however must run to completion, no skipping allowed!
     if: ${{ always() && needs.host.result == 'success' }}
     runs-on: "ubuntu-22.04"
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
           submodules: recursive
