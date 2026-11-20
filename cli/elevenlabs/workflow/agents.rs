@@ -497,6 +497,7 @@ struct WidgetArgs {
 
 fn handle_widget(args: WidgetArgs, _ctx: &AppContext) -> Result<(), CliError> {
     let _scope = api::command_scope("agents.widget");
+    validate_widget_agent_id(&args.agent_id)?;
     let config = require_agents()?;
     let agent = config
         .agents
@@ -510,15 +511,7 @@ fn handle_widget(args: WidgetArgs, _ctx: &AppContext) -> Result<(), CliError> {
         })?;
 
     let residency = settings::read_residency();
-    let mut html = format!("<elevenlabs-convai agent-id=\"{}\"", args.agent_id);
-    // Isolated regions need the server-location attribute; global/us don't.
-    if residency != "global" && residency != "us" {
-        html.push_str(&format!(" server-location=\"{residency}\""));
-    }
-    html.push_str(
-        "></elevenlabs-convai>\n<script src=\"https://unpkg.com/@elevenlabs/convai-widget-embed\" \
-         async type=\"text/javascript\"></script>",
-    );
+    let html = widget_snippet(&args.agent_id, &residency)?;
 
     let name = agent_display_name(&agent.config);
     println!("HTML Widget for agent '{name}' (residency: {residency}):");
@@ -527,6 +520,66 @@ fn handle_widget(args: WidgetArgs, _ctx: &AppContext) -> Result<(), CliError> {
     println!("{}", "=".repeat(60));
     println!("Agent ID: {}", args.agent_id);
     Ok(())
+}
+
+/// Agent ids are pasted into an HTML attribute, so only the characters real
+/// ids use are accepted.
+fn validate_widget_agent_id(agent_id: &str) -> Result<(), CliError> {
+    let valid = !agent_id.is_empty()
+        && agent_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if valid {
+        Ok(())
+    } else {
+        Err(CliError::Validation(format!(
+            "Invalid agent ID {agent_id:?}: only letters, digits, '_' and '-' are allowed"
+        )))
+    }
+}
+
+/// Build the embeddable `<elevenlabs-convai>` snippet. Both attribute values
+/// are validated and HTML-escaped so a tampered `agents.json` id or settings
+/// file cannot inject markup into the page the snippet is pasted into.
+fn widget_snippet(agent_id: &str, residency: &str) -> Result<String, CliError> {
+    validate_widget_agent_id(agent_id)?;
+    if !settings::RESIDENCY_VALUES.contains(&residency) {
+        return Err(CliError::Validation(format!(
+            "Invalid residency {residency:?} in settings; expected one of: {}",
+            settings::RESIDENCY_VALUES.join(", ")
+        )));
+    }
+    let mut html = format!(
+        "<elevenlabs-convai agent-id=\"{}\"",
+        escape_html_attr(agent_id)
+    );
+    // Isolated regions need the server-location attribute; global/us don't.
+    if residency != "global" && residency != "us" {
+        html.push_str(&format!(
+            " server-location=\"{}\"",
+            escape_html_attr(residency)
+        ));
+    }
+    html.push_str(
+        "></elevenlabs-convai>\n<script src=\"https://unpkg.com/@elevenlabs/convai-widget-embed\" \
+         async type=\"text/javascript\"></script>",
+    );
+    Ok(html)
+}
+
+fn escape_html_attr(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 // ── test ────────────────────────────────────────────────────────────
@@ -1603,6 +1656,54 @@ fn finish_sparse_config(full: &Value, mut value: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn widget_snippet_rejects_markup_in_agent_id() {
+        for id in [
+            "agent\"><script>alert(1)</script>",
+            "agent<b>",
+            "agent' onload='x",
+            "agent id",
+            "",
+        ] {
+            assert!(
+                matches!(widget_snippet(id, "global"), Err(CliError::Validation(_))),
+                "id {id:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn widget_snippet_rejects_unknown_residency() {
+        for residency in ["eu\"><script>alert(1)</script>", "mars", ""] {
+            assert!(
+                matches!(
+                    widget_snippet("agent_123-abc", residency),
+                    Err(CliError::Validation(_))
+                ),
+                "residency {residency:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn widget_snippet_formats_valid_values() {
+        let html = widget_snippet("agent_123-abc", "global").unwrap();
+        assert!(
+            html.starts_with("<elevenlabs-convai agent-id=\"agent_123-abc\"></elevenlabs-convai>")
+        );
+        assert!(!html.contains("server-location"));
+
+        let html = widget_snippet("agent_123-abc", "eu-residency").unwrap();
+        assert!(html.starts_with(
+            "<elevenlabs-convai agent-id=\"agent_123-abc\" server-location=\"eu-residency\"></elevenlabs-convai>"
+        ));
+    }
+
+    #[test]
+    fn escape_html_attr_escapes_special_characters() {
+        assert_eq!(escape_html_attr("a\"<b>&'c"), "a&quot;&lt;b&gt;&amp;&#39;c");
+    }
 
     /// Every command in the next-steps must be one a new user can paste and
     /// run. A tester copied these and hit a 422 on the tool name and a
