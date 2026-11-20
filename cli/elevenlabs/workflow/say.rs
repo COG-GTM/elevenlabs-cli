@@ -378,7 +378,7 @@ fn player_argv(player: &Player, target: &str) -> Vec<String> {
 }
 
 fn spawn_player(player: &Player, target: &str, stdin: Stdio) -> Result<Child, CliError> {
-    Command::new(&player.program)
+    fern_cli_sdk::without_dotenv_vars(&mut Command::new(&player.program))
         .args(player_argv(player, target))
         .stdin(stdin)
         .spawn()

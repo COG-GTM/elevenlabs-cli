@@ -96,6 +96,80 @@ const DOTENV_DENIED_BARE: &[&str] = &[
     "SSL_CERT_DIR",
     "CURL_CA_BUNDLE",
     "REQUESTS_CA_BUNDLE",
+    // Leaks the TLS session keys to a file of the attacker's choosing.
+    "SSLKEYLOGFILE",
+    // Forces credentials into a plaintext file (under `/tmp` when `HOME` is unset).
+    "FERN_CLI_CREDENTIAL_STORE",
+    // Where the CLI and the programs it starts find their settings, and with
+    // it a `player` the CLI runs. A shell without `HOME` (native Windows) would
+    // otherwise let `.env` pick the file.
+    "HOME",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    // Which program a bare name resolves to, and the shells and editors that
+    // programs start.
+    "PATH",
+    "PATHEXT",
+    "COMSPEC",
+    "SYSTEMROOT",
+    "WINDIR",
+    "PSMODULEPATH",
+    "SHELL",
+    "BASH_ENV",
+    "ENV",
+    "ZDOTDIR",
+    "PROMPT_COMMAND",
+    "PS4",
+    "IFS",
+    "EDITOR",
+    "VISUAL",
+    // Code or modules a started program loads before doing anything else.
+    "NODE_OPTIONS",
+    "NODE_PATH",
+    "NODE_EXTRA_CA_CERTS",
+    "NODE_TLS_REJECT_UNAUTHORIZED",
+    "JAVA_TOOL_OPTIONS",
+    "_JAVA_OPTIONS",
+    "JDK_JAVA_OPTIONS",
+    "GCONV_PATH",
+    "LOCPATH",
+    "NLSPATH",
+    "TERMINFO",
+    "TERMINFO_DIRS",
+    "DBUS_SESSION_BUS_ADDRESS",
+    // Resolver overrides that can send the API host somewhere else.
+    "HOSTALIASES",
+    "RES_OPTIONS",
+    "LOCALDOMAIN",
+];
+
+/// Prefixes of unscoped env vars a `.env` file may not set: whole families
+/// that make a program the CLI starts (pager, browser opener, audio player,
+/// `npx`) load a library or run a command. `LD_PRELOAD` and
+/// `DYLD_INSERT_LIBRARIES` load code into every dynamically linked child;
+/// `LESSOPEN`/`LESSEDIT` make `less` run a command; `npm_config_*` and
+/// `GIT_*` configure tools that run hooks and scripts.
+const DOTENV_DENIED_PREFIXES: &[&str] = &[
+    "LD_",
+    "DYLD_",
+    "LESS",
+    "NPM_",
+    "GIT_",
+    "XDG_",
+    "OPENSSL_",
+    "PYTHON",
+    "PERL",
+    "RUBY",
+    "BASH_FUNC_",
+    "GTK_",
+    "GIO_",
+    "QT_",
 ];
 
 /// Suffixes of `<PREFIX>_…` env vars a `.env` file may not set. Same
@@ -122,7 +196,9 @@ const DOTENV_DENIED_SUFFIXES: &[&str] = &[
 /// Windows treats environment names as case-insensitive.
 pub(crate) fn dotenv_key_is_denied(key: &str, prefix: &str) -> bool {
     let key = key.to_ascii_uppercase();
-    if DOTENV_DENIED_BARE.contains(&key.as_str()) {
+    if DOTENV_DENIED_BARE.contains(&key.as_str())
+        || DOTENV_DENIED_PREFIXES.iter().any(|p| key.starts_with(p))
+    {
         return true;
     }
     key.strip_prefix(prefix)
@@ -156,6 +232,7 @@ pub fn load_dotenv_filtered(cli_name: &str) -> Vec<String> {
         // No `.env` (the common case) or it is unreadable — nothing to do.
         return ignored;
     };
+    let mut loaded = DOTENV_LOADED_KEYS.lock().unwrap_or_else(|e| e.into_inner());
     for entry in entries.flatten() {
         let (key, value) = entry;
         if dotenv_key_is_denied(&key, &prefix) {
@@ -165,9 +242,24 @@ pub fn load_dotenv_filtered(cli_name: &str) -> Vec<String> {
         // Real environment wins, as with `dotenvy::dotenv()`.
         if std::env::var_os(&key).is_none() {
             std::env::set_var(&key, &value);
+            loaded.push(key);
         }
     }
     ignored
+}
+
+/// The keys [`load_dotenv_filtered`] added to this process's environment.
+static DOTENV_LOADED_KEYS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Start `cmd` without the keys the project's `.env` added, so a program the
+/// CLI runs (pager, audio player, `npx`) sees only what the shell gave this
+/// process. `.env` is for the CLI's own credentials and preferences; no deny-list
+/// can name every variable that makes some program load code or run a command.
+pub fn without_dotenv_vars(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    for key in DOTENV_LOADED_KEYS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        cmd.env_remove(key);
+    }
+    cmd
 }
 
 /// Report the keys [`load_dotenv_filtered`] dropped. Call after
@@ -199,6 +291,8 @@ mod dotenv_filter_tests {
             "ELEVENLABS_TIMEOUT_SECS",
             "ELEVENLABS_CONNECT_TIMEOUT_SECS",
             "SOME_UNRELATED_APP_KEY",
+            // Common in a JS project's `.env`; must not draw a warning.
+            "NODE_ENV",
         ] {
             assert!(
                 !dotenv_key_is_denied(key, "ELEVENLABS"),
@@ -268,6 +362,75 @@ mod dotenv_filter_tests {
         assert!(!dotenv_key_is_denied("BASE_URL", "ELEVENLABS"));
         // Kebab-cased binary names map to underscored prefixes.
         assert!(dotenv_key_is_denied("MY_CLI_BASE_URL", "MY_CLI"));
+    }
+
+    #[test]
+    fn loader_and_child_program_keys_are_denied_from_dotenv() {
+        // Each makes a program the CLI starts (pager, browser opener, audio
+        // player, `npx`) load a library or run a command, or moves the
+        // settings file that names the audio player.
+        for key in [
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "LD_AUDIT",
+            "DYLD_INSERT_LIBRARIES",
+            "DYLD_LIBRARY_PATH",
+            "LESSOPEN",
+            "LESSCLOSE",
+            "LESS",
+            "LESSKEY",
+            "LESSEDIT",
+            "NODE_OPTIONS",
+            "NODE_PATH",
+            "npm_config_userconfig",
+            "NPM_CONFIG_PREFIX",
+            "HOME",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_DIRS",
+            "PATH",
+            "Path",
+            "PATHEXT",
+            "SHELL",
+            "BASH_ENV",
+            "ENV",
+            "EDITOR",
+            "VISUAL",
+            "GIT_SSH_COMMAND",
+            "GIT_CONFIG_GLOBAL",
+            "OPENSSL_CONF",
+            "PYTHONPATH",
+            "PYTHONSTARTUP",
+            "PERL5OPT",
+            "RUBYOPT",
+            "JAVA_TOOL_OPTIONS",
+            "GCONV_PATH",
+            "GTK_MODULES",
+            "BASH_FUNC_ls%%",
+            "SSLKEYLOGFILE",
+            "FERN_CLI_CREDENTIAL_STORE",
+            "ld_preload",
+        ] {
+            assert!(
+                dotenv_key_is_denied(key, "ELEVENLABS"),
+                "{key} must not be settable from .env"
+            );
+        }
+    }
+
+    #[test]
+    fn dotenv_keys_are_removed_from_started_programs() {
+        super::DOTENV_LOADED_KEYS
+            .lock()
+            .unwrap()
+            .push("DOTENV_FILTER_TEST_KEY".to_string());
+        let mut cmd = std::process::Command::new("true");
+        super::without_dotenv_vars(&mut cmd);
+        assert!(cmd
+            .get_envs()
+            .any(|(k, v)| k == "DOTENV_FILTER_TEST_KEY" && v.is_none()));
     }
 
     #[test]
