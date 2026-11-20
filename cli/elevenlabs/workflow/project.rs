@@ -208,10 +208,17 @@ fn escaped(path_str: &str, root: &Path) -> CliError {
     ))
 }
 
-/// Open a file for writing, refusing to follow a symlink at the final
-/// component. Without this a symlink planted in the project redirects the write
-/// to its target — including creating the target when the link dangles.
-fn create_no_follow(path: &Path) -> Result<std::fs::File, CliError> {
+/// Why [`open_truncate_no_follow`] failed.
+pub(crate) enum NoFollowError {
+    /// The final path component is a symlink (dangling or not).
+    Symlink,
+    Io(std::io::Error),
+}
+
+/// Create or truncate a file for writing, refusing to follow a symlink at the
+/// final component. Without this a symlink planted in the project redirects the
+/// write to its target — including creating the target when the link dangles.
+pub(crate) fn open_truncate_no_follow(path: &Path) -> Result<std::fs::File, NoFollowError> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -224,7 +231,7 @@ fn create_no_follow(path: &Path) -> Result<std::fs::File, CliError> {
         // No O_NOFOLLOW equivalent; check explicitly (racy, but better than nothing).
         if let Ok(meta) = std::fs::symlink_metadata(path) {
             if meta.file_type().is_symlink() {
-                return Err(symlink_refused(path));
+                return Err(NoFollowError::Symlink);
             }
         }
     }
@@ -232,12 +239,19 @@ fn create_no_follow(path: &Path) -> Result<std::fs::File, CliError> {
         // ELOOP is what O_NOFOLLOW returns for a symlink.
         #[cfg(unix)]
         if e.raw_os_error() == Some(libc::ELOOP) {
-            return symlink_refused(path);
+            return NoFollowError::Symlink;
         }
-        CliError::Other(anyhow::anyhow!(
+        NoFollowError::Io(e)
+    })
+}
+
+fn create_no_follow(path: &Path) -> Result<std::fs::File, CliError> {
+    open_truncate_no_follow(path).map_err(|e| match e {
+        NoFollowError::Symlink => symlink_refused(path),
+        NoFollowError::Io(e) => CliError::Other(anyhow::anyhow!(
             "Could not write configuration file to {}: {e}",
             path.display()
-        ))
+        )),
     })
 }
 

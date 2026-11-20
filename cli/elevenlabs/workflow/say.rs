@@ -27,6 +27,7 @@ use fern_cli_sdk::sdk_executor::SdkRequestExecutor;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 
+use super::project::{open_truncate_no_follow, NoFollowError};
 use super::settings;
 
 /// George — the voice the co-generated SDK uses in its own doctests, so a
@@ -629,8 +630,17 @@ fn handle_say(args: SayArgs, ctx: &AppContext) -> Result<(), CliError> {
 
     match (&args.output, &player) {
         (Some(path), _) => {
-            let mut file = std::fs::File::create(path).map_err(|e| {
-                CliError::Other(anyhow::anyhow!("Could not create {}: {e}", path.display()))
+            // `--output` often names a file inside a cloned repo, where a
+            // planted symlink would otherwise redirect the write to its target.
+            let mut file = open_truncate_no_follow(path).map_err(|e| match e {
+                NoFollowError::Symlink => CliError::Validation(format!(
+                    "Refusing to write audio through the symlink at {}. Remove it or \
+                     choose another --output path.",
+                    path.display()
+                )),
+                NoFollowError::Io(e) => {
+                    CliError::Other(anyhow::anyhow!("Could not create {}: {e}", path.display()))
+                }
             })?;
             pump(response, &mut file)?;
             eprintln!("Saved to {}", path.display());

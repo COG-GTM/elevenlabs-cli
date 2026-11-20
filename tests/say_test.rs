@@ -271,3 +271,70 @@ async fn stored_defaults_drive_the_request() {
     assert_eq!(config["say"]["model_id"], "eleven_multilingual_v2");
     assert!(config["say"].get("voice_id").is_none());
 }
+
+/// A cloned repo can ship `--output`'s path as a symlink into the user's home.
+/// Following it would truncate the target and fill it with audio, so `say`
+/// must refuse — and must not create the target when the link dangles.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn output_refuses_to_write_through_a_symlink() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v1/text-to-speech/{VOICE_ID}/stream")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(AUDIO))
+        .mount(&server)
+        .await;
+
+    let home = tempfile::tempdir().expect("tempdir");
+    let victim = home.path().join("victim.txt");
+    std::fs::write(&victim, b"precious").expect("write victim");
+    let dangling_target = home.path().join("never-created.txt");
+
+    for (link_name, target) in [("out.mp3", &victim), ("dangling.mp3", &dangling_target)] {
+        let link = home.path().join(link_name);
+        std::os::unix::fs::symlink(target, &link).expect("symlink");
+
+        let out = cli(
+            home.path(),
+            &[
+                "say",
+                "hello",
+                "--base-url",
+                &server.uri(),
+                "--output",
+                link.to_str().unwrap(),
+            ],
+        );
+
+        assert!(
+            !out.status.success(),
+            "say --output should refuse the symlink {link_name}"
+        );
+        let reported = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            reported.contains("symlink"),
+            "the error should name the symlink, got: {reported}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("link still there")
+                .file_type()
+                .is_symlink(),
+            "the link itself should be left alone"
+        );
+    }
+
+    assert_eq!(
+        std::fs::read(&victim).expect("read victim"),
+        b"precious",
+        "the symlink target must not be overwritten"
+    );
+    assert!(
+        !dangling_target.exists(),
+        "a dangling symlink must not be used to create its target"
+    );
+}
