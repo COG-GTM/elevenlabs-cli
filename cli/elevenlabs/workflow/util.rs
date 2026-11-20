@@ -50,6 +50,29 @@ pub fn plan_pull_action(exists_locally: bool, update: bool, all: bool) -> PullAc
     }
 }
 
+/// `text` without control characters (an escape sequence in a tool name
+/// could otherwise clear or rewrite the terminal, with or without colour)
+/// and without the invisible or reordering Unicode that could disguise what
+/// is printed: zero-width characters, bidi overrides and isolates, and line
+/// separators. Newlines and tabs become spaces, since every caller prints
+/// the value inside a single line. Use it on any name, ID, path or error
+/// text that comes from a project file, an index file or an API response.
+/// The same policy as the CLI's own output sanitizer.
+pub fn terminal_safe(text: &str) -> String {
+    text.chars()
+        .filter_map(|c| match c {
+            '\n' | '\r' | '\t' => Some(' '),
+            c if c.is_control() => None,
+            '\u{200B}'..='\u{200D}'
+            | '\u{FEFF}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2028}'..='\u{2029}'
+            | '\u{2066}'..='\u{2069}' => None,
+            c => Some(c),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,5 +134,13 @@ mod tests {
         // both flags still skips items that don't exist locally.
         assert_eq!(plan_pull_action(true, true, true), PullAction::Update);
         assert_eq!(plan_pull_action(false, true, true), PullAction::Skip);
+    }
+
+    #[test]
+    fn terminal_safe_strips_escapes_and_invisible_unicode() {
+        assert_eq!(terminal_safe("a\u{1b}[2Jb\u{7}c"), "a[2Jbc");
+        assert_eq!(terminal_safe("x\u{202E}y\u{200B}z\u{2066}"), "xyz");
+        assert_eq!(terminal_safe("one\r\ntwo\tthree"), "one  two three");
+        assert_eq!(terminal_safe("Café 日本"), "Café 日本");
     }
 }
