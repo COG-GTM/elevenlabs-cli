@@ -125,29 +125,7 @@ pub fn spawn_pager(config: &PagerConfig, label: &str) -> Option<PagerHandle> {
         return None;
     }
 
-    // Split $PAGER on whitespace so values like "less -R" work.
-    let parts: Vec<&str> = config.program.split_whitespace().collect();
-    let (program, extra_args) = match parts.split_first() {
-        Some((prog, args)) => (*prog, args),
-        None => return None,
-    };
-
-    let mut cmd = Command::new(program);
-    cmd.args(extra_args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-
-    // Set LESS defaults on the child process only (thread-safe).
-    // F = quit-if-one-screen, R = ANSI color only, X = no init/deinit.
-    if std::env::var("LESS").is_err() {
-        cmd.env("LESS", "FRX");
-    }
-
-    if is_less_compatible(program) && !extra_args.iter().any(|a| a.starts_with("-P")) {
-        cmd.arg(format!("-P{label}"));
-    }
-
+    let mut cmd = pager_command(config, label)?;
     match cmd.spawn() {
         Ok(mut child) => {
             let stdin = child.stdin.take();
@@ -162,6 +140,41 @@ pub fn spawn_pager(config: &PagerConfig, label: &str) -> Option<PagerHandle> {
             None
         }
     }
+}
+
+/// Build the pager child process without starting it. Returns `None` when
+/// the configured program is empty.
+///
+/// Every variable taken from `.env` is removed from the child's environment:
+/// `less` runs `LESSOPEN`/`LESSCLOSE` as shell commands, so only the
+/// operator's real environment may configure the pager.
+pub fn pager_command(config: &PagerConfig, label: &str) -> Option<Command> {
+    // Split $PAGER on whitespace so values like "less -R" work.
+    let parts: Vec<&str> = config.program.split_whitespace().collect();
+    let (program, extra_args) = parts.split_first()?;
+    let program = *program;
+
+    let mut cmd = Command::new(program);
+    cmd.args(extra_args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+
+    for key in crate::dotenv_loaded_keys() {
+        cmd.env_remove(key);
+    }
+
+    // Set LESS defaults on the child process only (thread-safe).
+    // F = quit-if-one-screen, R = ANSI color only, X = no init/deinit.
+    if std::env::var("LESS").is_err() {
+        cmd.env("LESS", "FRX");
+    }
+
+    if is_less_compatible(program) && !extra_args.iter().any(|a| a.starts_with("-P")) {
+        cmd.arg(format!("-P{label}"));
+    }
+
+    Some(cmd)
 }
 
 /// Check if the pager program is `less` or a less-compatible program.
