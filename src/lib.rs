@@ -96,7 +96,26 @@ const DOTENV_DENIED_BARE: &[&str] = &[
     "SSL_CERT_DIR",
     "CURL_CA_BUNDLE",
     "REQUESTS_CA_BUNDLE",
+    // Options for the Windows default pager, read by the child we spawn.
+    "MORE",
+    // Name programs other tools run on the user's behalf.
+    "EDITOR",
+    "VISUAL",
+    "SHELL",
+    "BASH_ENV",
+    "ENV",
+    // Decide which binary a bare program name such as `less` resolves to.
+    "PATH",
+    "PATHEXT",
 ];
+
+/// Prefixes of unscoped env vars a `.env` file may not set. Every `LESS…`
+/// variable is read by `less`, the default pager, and several of them run
+/// commands: `LESSOPEN`/`LESSCLOSE` are shell commands (`|-cmd` runs even when
+/// `less` reads a pipe), `LESSEDIT` names an editor, `LESSKEYIN` can bind keys
+/// to shell escapes, and `LESS` itself can carry `+!cmd`. `LD_`/`DYLD_`
+/// inject shared libraries into any child process.
+const DOTENV_DENIED_BARE_PREFIXES: &[&str] = &["LESS", "LD_", "DYLD_"];
 
 /// Suffixes of `<PREFIX>_…` env vars a `.env` file may not set. Same
 /// reasoning as [`DOTENV_DENIED_BARE`], plus the two cross-host guards — a
@@ -122,7 +141,11 @@ const DOTENV_DENIED_SUFFIXES: &[&str] = &[
 /// Windows treats environment names as case-insensitive.
 pub(crate) fn dotenv_key_is_denied(key: &str, prefix: &str) -> bool {
     let key = key.to_ascii_uppercase();
-    if DOTENV_DENIED_BARE.contains(&key.as_str()) {
+    if DOTENV_DENIED_BARE.contains(&key.as_str())
+        || DOTENV_DENIED_BARE_PREFIXES
+            .iter()
+            .any(|p| key.starts_with(p))
+    {
         return true;
     }
     key.strip_prefix(prefix)
@@ -137,11 +160,14 @@ pub(crate) fn dotenv_key_is_denied(key: &str, prefix: &str) -> bool {
 /// the CLI at another host, disable certificate verification, route requests
 /// through a proxy, turn off the cross-host redirect and pagination guards, or
 /// name an arbitrary program for the CLI to execute as its pager. The last is
-/// the sharpest: `<PREFIX>_PAGER` is run as a command.
+/// the sharpest: `<PREFIX>_PAGER` is run as a command, and so is `LESSOPEN`
+/// when the default `less` pager starts.
 ///
 /// The legitimate use of `.env` — credentials and output preferences — is
-/// unaffected; only the keys in [`DOTENV_DENIED_BARE`] and
-/// [`DOTENV_DENIED_SUFFIXES`] are dropped. Real process environment always
+/// unaffected; only the keys in [`DOTENV_DENIED_BARE`],
+/// [`DOTENV_DENIED_BARE_PREFIXES`] and [`DOTENV_DENIED_SUFFIXES`] are dropped.
+/// The keys that are loaded are recorded so child processes the CLI spawns
+/// (the pager) can be started without them — see [`dotenv_loaded_keys`]. Real process environment always
 /// wins, matching `dotenvy::dotenv()`'s own precedence, so anything genuinely
 /// exported by the operator's shell still applies.
 /// Returns the keys that were ignored, in file order, so the caller can report
@@ -165,9 +191,28 @@ pub fn load_dotenv_filtered(cli_name: &str) -> Vec<String> {
         // Real environment wins, as with `dotenvy::dotenv()`.
         if std::env::var_os(&key).is_none() {
             std::env::set_var(&key, &value);
+            DOTENV_LOADED_KEYS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(key);
         }
     }
     ignored
+}
+
+/// Keys [`load_dotenv_filtered`] copied from `.env` into the process
+/// environment (keys the real environment already set are not included).
+static DOTENV_LOADED_KEYS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// The keys this process took from `.env` rather than from the operator's
+/// shell. Child programs the CLI spawns are started without them, so no
+/// variable an untrusted `.env` supplied — whether or not the deny lists know
+/// about it — reaches a program that might interpret it.
+pub fn dotenv_loaded_keys() -> Vec<String> {
+    DOTENV_LOADED_KEYS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
 
 /// Report the keys [`load_dotenv_filtered`] dropped. Call after
@@ -238,6 +283,41 @@ mod dotenv_filter_tests {
             "elevenlabs_base_url",
             "Elevenlabs_Insecure",
             "browser",
+        ] {
+            assert!(
+                dotenv_key_is_denied(key, "ELEVENLABS"),
+                "{key} must not be settable from .env"
+            );
+        }
+    }
+
+    #[test]
+    fn pager_and_child_process_keys_are_denied_from_dotenv() {
+        // `less` (the default pager) runs LESSOPEN/LESSCLOSE as shell
+        // commands; the rest name programs or libraries a child would load.
+        for key in [
+            "LESSOPEN",
+            "LESSCLOSE",
+            "LESSKEYIN",
+            "LESSKEYIN_SYSTEM",
+            "LESSKEY",
+            "LESSEDIT",
+            "LESSSECURE",
+            "LESSSECURE_ALLOW",
+            "LESS",
+            "lessopen",
+            "LessClose",
+            "MORE",
+            "EDITOR",
+            "VISUAL",
+            "SHELL",
+            "BASH_ENV",
+            "ENV",
+            "PATH",
+            "PATHEXT",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "DYLD_INSERT_LIBRARIES",
         ] {
             assert!(
                 dotenv_key_is_denied(key, "ELEVENLABS"),
