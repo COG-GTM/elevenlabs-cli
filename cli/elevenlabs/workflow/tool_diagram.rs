@@ -31,6 +31,7 @@ use super::mermaid::{
     fence, quote, str_field, terminal_width, truncate, use_color, Format, MermaidIds,
     NODE_LABEL_MAX,
 };
+use super::util::printable;
 use super::{api, project};
 
 /// Register `tools diagram`.
@@ -1217,7 +1218,7 @@ fn array(value: Option<&Value>) -> impl Iterator<Item = &Value> {
 }
 
 fn one_line(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    printable(&text.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
 /// A JSON value on one line: strings quoted.

@@ -27,6 +27,15 @@ pub fn opt_string(matches: &clap::ArgMatches, id: &str) -> Option<String> {
     matches.get_one::<String>(id).cloned()
 }
 
+/// `text` with every control character (ESC, BEL, C1 codes, line breaks…)
+/// replaced by `\u{FFFD}`, so names and labels from config files or the API
+/// cannot drive the terminal they are printed to.
+pub fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .collect()
+}
+
 /// What a `pull` should do with one remote entity.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PullAction {
@@ -85,6 +94,15 @@ mod tests {
             Some("a_1".to_string())
         );
         assert_eq!(opt_string(&matches_from(&["test"]), "agent"), None);
+    }
+
+    #[test]
+    fn printable_replaces_control_characters() {
+        assert_eq!(
+            printable("a\u{1b}[2Jb\u{7}\u{9b}c\nd"),
+            "a\u{FFFD}[2Jb\u{FFFD}\u{FFFD}c\u{FFFD}d"
+        );
+        assert_eq!(printable("Café · ok"), "Café · ok");
     }
 
     #[test]

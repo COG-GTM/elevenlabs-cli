@@ -16,7 +16,9 @@ use fern_cli_sdk::openapi::AppContext;
 use serde_json::{json, Value};
 
 use super::config_format::{is_literal_key, ConfigFormat, FORMAT_NAMES};
-use super::util::{downcast_ctx, dry_run_flag, opt_string, plan_pull_action, PullAction};
+use super::util::{
+    downcast_ctx, dry_run_flag, opt_string, plan_pull_action, printable, PullAction,
+};
 use super::{api, project, settings, templates, verify};
 
 /// Register the `agents` command group.
@@ -461,17 +463,17 @@ fn handle_status(_args: NoArgs, _ctx: &AppContext) -> Result<(), CliError> {
     println!("Agent Status:");
     println!("{}", "=".repeat(50));
     for agent in &config.agents {
-        println!("\n{}", agent_display_name(&agent.config));
-        println!("   Config: {}", agent.config);
+        println!("\n{}", printable(&agent_display_name(&agent.config)));
+        println!("   Config: {}", printable(&agent.config));
         println!(
             "   Agent ID: {}",
-            agent.id.as_deref().unwrap_or("Not created yet")
+            printable(agent.id.as_deref().unwrap_or("Not created yet"))
         );
         if let Some(branch_id) = &agent.branch_id {
-            println!("   Branch ID: {branch_id}");
+            println!("   Branch ID: {}", printable(branch_id));
         }
         if let Some(version_id) = &agent.version_id {
-            println!("   Version ID: {version_id}");
+            println!("   Version ID: {}", printable(version_id));
         }
         let config_path = Path::new(&agent.config);
         if !config_path.exists() {
@@ -520,7 +522,7 @@ fn handle_widget(args: WidgetArgs, _ctx: &AppContext) -> Result<(), CliError> {
          async type=\"text/javascript\"></script>",
     );
 
-    let name = agent_display_name(&agent.config);
+    let name = printable(&agent_display_name(&agent.config));
     println!("HTML Widget for agent '{name}' (residency: {residency}):");
     println!("{}", "=".repeat(60));
     println!("{html}");
@@ -639,7 +641,7 @@ fn handle_test(args: TestArgs, ctx: &AppContext) -> Result<(), CliError> {
                 .and_then(Value::as_str)
                 .or_else(|| run.get("test_id").and_then(Value::as_str))
                 .unwrap_or("Unknown");
-            println!("{mark} {name}: {status}");
+            println!("{mark} {}: {}", printable(name), printable(status));
             if status == "passed" {
                 passed += 1;
             } else {
@@ -739,8 +741,8 @@ fn handle_push(matches: &clap::ArgMatches, ctx: &AppContext) -> Result<(), CliEr
         let name = agent_config
             .get("name")
             .and_then(Value::as_str)
-            .unwrap_or("Unnamed Agent")
-            .to_string();
+            .unwrap_or("Unnamed Agent");
+        let name = printable(name);
 
         println!("{name}: Will push (force override)");
 
@@ -1009,7 +1011,7 @@ fn handle_pull(matches: &clap::ArgMatches, ctx: &AppContext) -> Result<(), CliEr
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        println!("Found agent: {name}");
+        println!("Found agent: {}", printable(&name));
         vec![(id, name)]
     } else {
         println!("Pulling all agents from ElevenLabs...");
@@ -1078,8 +1080,9 @@ fn handle_pull(matches: &clap::ArgMatches, ctx: &AppContext) -> Result<(), CliEr
     // rest are still registered, so a retry doesn't duplicate their files.
     let mut failed = 0;
     for (action, id, name, existing_idx) in &plan {
+        let shown = printable(name);
         if *action == PullAction::Skip {
-            println!("⊘ Skipping '{name}' (already exists, use --update to overwrite)");
+            println!("⊘ Skipping '{shown}' (already exists, use --update to overwrite)");
             continue;
         }
         if dry_run {
@@ -1088,7 +1091,10 @@ fn handle_pull(matches: &clap::ArgMatches, ctx: &AppContext) -> Result<(), CliEr
             } else {
                 "pull"
             };
-            println!("[DRY RUN] Would {verb} agent: {name} (ID: {id})");
+            println!(
+                "[DRY RUN] Would {verb} agent: {shown} (ID: {})",
+                printable(id)
+            );
             continue;
         }
 
@@ -1097,12 +1103,12 @@ fn handle_pull(matches: &clap::ArgMatches, ctx: &AppContext) -> Result<(), CliEr
         } else {
             "+ Pulling"
         };
-        println!("{verb} config for '{name}'...");
+        println!("{verb} config for '{shown}'...");
 
         let live = match api::get_agent(ctx, id, branch_id.as_deref()) {
             Ok(v) => v,
             Err(e) => {
-                println!("  ✗ Error pulling agent '{name}': {e}");
+                println!("  ✗ Error pulling agent '{shown}': {e}");
                 continue;
             }
         };
@@ -1122,13 +1128,13 @@ fn handle_pull(matches: &clap::ArgMatches, ctx: &AppContext) -> Result<(), CliEr
                 let config = match config_to_write(&full, Some(&cfg_path), sparse) {
                     Ok(config) => config,
                     Err(e) => {
-                        println!("  ✗ Error reading '{name}': {e}");
+                        println!("  ✗ Error reading '{shown}': {e}");
                         failed += 1;
                         continue;
                     }
                 };
                 if let Err(e) = project::write_config_in_project(&cfg_path, &config) {
-                    println!("  ✗ Error saving '{name}': {e}");
+                    println!("  ✗ Error saving '{shown}': {e}");
                     failed += 1;
                     continue;
                 }
@@ -1138,7 +1144,7 @@ fn handle_pull(matches: &clap::ArgMatches, ctx: &AppContext) -> Result<(), CliEr
                 if let Some(b) = &live_branch_id {
                     registry.agents[*i].branch_id = Some(b.clone());
                 }
-                println!("  ✓ Updated '{name}' (config: {cfg_path})");
+                println!("  ✓ Updated '{shown}' (config: {cfg_path})");
                 *i
             }
             None => {
@@ -1150,13 +1156,13 @@ fn handle_pull(matches: &clap::ArgMatches, ctx: &AppContext) -> Result<(), CliEr
                 let config = match config_to_write(&full, None, sparse) {
                     Ok(config) => config,
                     Err(e) => {
-                        println!("  ✗ Error preparing '{name}': {e}");
+                        println!("  ✗ Error preparing '{shown}': {e}");
                         failed += 1;
                         continue;
                     }
                 };
                 if let Err(e) = project::write_config_in_project(&cfg_path, &config) {
-                    println!("  ✗ Error saving '{name}': {e}");
+                    println!("  ✗ Error saving '{shown}': {e}");
                     failed += 1;
                     continue;
                 }
@@ -1167,7 +1173,7 @@ fn handle_pull(matches: &clap::ArgMatches, ctx: &AppContext) -> Result<(), CliEr
                     version_id: version_id.clone(),
                     branches: None,
                 });
-                println!("  ✓ Added '{name}' (config: {cfg_path})");
+                println!("  ✓ Added '{shown}' (config: {cfg_path})");
                 registry.agents.len() - 1
             }
         };
@@ -1201,13 +1207,13 @@ fn handle_pull(matches: &clap::ArgMatches, ctx: &AppContext) -> Result<(), CliEr
                 match config_to_write(&full, existing_branch_path.as_deref(), sparse) {
                     Ok(config) => config,
                     Err(e) => {
-                        println!("  ✗ Error reading branch '{branch}' of '{name}': {e}");
+                        println!("  ✗ Error reading branch '{branch}' of '{shown}': {e}");
                         failed += 1;
                         continue;
                     }
                 };
             if let Err(e) = project::write_config_in_project(&branch_path, &branch_config) {
-                println!("  ✗ Error saving branch '{branch}' of '{name}': {e}");
+                println!("  ✗ Error saving branch '{branch}' of '{shown}': {e}");
                 failed += 1;
                 continue;
             }
@@ -1238,7 +1244,7 @@ fn handle_pull(matches: &clap::ArgMatches, ctx: &AppContext) -> Result<(), CliEr
             ) {
                 Ok(n) => failed += n,
                 Err(e) => {
-                    println!("  ✗ Error pulling branches of '{name}': {e}");
+                    println!("  ✗ Error pulling branches of '{shown}': {e}");
                     failed += 1;
                 }
             }
@@ -1291,10 +1297,11 @@ fn pull_all_branches(
     config_format: Option<ConfigFormat>,
     sparse: bool,
 ) -> Result<usize, CliError> {
-    println!("  Fetching branches for '{agent_name}'...");
+    let shown = printable(agent_name);
+    println!("  Fetching branches for '{shown}'...");
     let branches = api::list_branches(ctx, agent_id, false)?;
     if branches.is_empty() {
-        println!("  No branches found for '{agent_name}'");
+        println!("  No branches found for '{shown}'");
         return Ok(0);
     }
 
@@ -1311,6 +1318,7 @@ fn pull_all_branches(
         }
         let bid = branch.get("id").and_then(Value::as_str).unwrap_or("");
         let bname = branch.get("name").and_then(Value::as_str).unwrap_or("");
+        let shown_bname = printable(bname);
         // Skip the main branch (matches the agent's branch_id, or is named
         // "main" when the agent has no branch_id).
         let is_main = Some(bid) == parent_branch_id.as_deref()
@@ -1322,7 +1330,7 @@ fn pull_all_branches(
         let live = match api::get_agent(ctx, agent_id, Some(bid)) {
             Ok(v) => v,
             Err(e) => {
-                println!("  ✗ Error pulling branch '{bname}': {e}");
+                println!("  ✗ Error pulling branch '{shown_bname}': {e}");
                 continue;
             }
         };
@@ -1346,13 +1354,13 @@ fn pull_all_branches(
         let branch_config = match config_to_write(&full, existing_path.as_deref(), sparse) {
             Ok(config) => config,
             Err(e) => {
-                println!("  ✗ Error reading branch '{bname}': {e}");
+                println!("  ✗ Error reading branch '{shown_bname}': {e}");
                 failed += 1;
                 continue;
             }
         };
         if let Err(e) = project::write_config_in_project(&branch_path, &branch_config) {
-            println!("  ✗ Error saving branch '{bname}': {e}");
+            println!("  ✗ Error saving branch '{shown_bname}': {e}");
             failed += 1;
             continue;
         }
@@ -1368,7 +1376,7 @@ fn pull_all_branches(
                 version_id,
             },
         );
-        println!("  ✓ Branch '{bname}' ({branch_path})");
+        println!("  ✓ Branch '{shown_bname}' ({})", printable(&branch_path));
     }
 
     let count = registry.agents[entry_idx]
