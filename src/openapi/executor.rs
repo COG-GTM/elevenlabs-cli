@@ -1715,24 +1715,25 @@ async fn handle_binary_response(
         return Ok(None);
     }
 
-    let file_path = if let Some(p) = output_path {
-        PathBuf::from(p)
-    } else if let Some(name) = response
-        .headers()
-        .get(reqwest::header::CONTENT_DISPOSITION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(extract_content_disposition_filename)
-    {
-        // The server named the file via RFC 6266 Content-Disposition — use
-        // it. The helper has already reduced the value to its safe basename
-        // so the server can never pick the output directory.
-        PathBuf::from(name)
+    let (file_path, mut file) = if let Some(p) = output_path {
+        // The operator typed this path, so overwriting it is their call.
+        let path = PathBuf::from(p);
+        let file = create_file_no_follow(&path).await?;
+        (path, file)
     } else {
-        let ext = mime_to_extension(content_type);
-        PathBuf::from(format!("download.{ext}"))
+        // The server named the file via RFC 6266 Content-Disposition, or we
+        // fall back to the predictable `download.<ext>`. The helper has
+        // already reduced the header value to its safe basename so the
+        // server can never pick the output directory, and the name is
+        // never allowed to replace an existing file.
+        let name = response
+            .headers()
+            .get(reqwest::header::CONTENT_DISPOSITION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(extract_content_disposition_filename)
+            .unwrap_or_else(|| format!("download.{}", mime_to_extension(content_type)));
+        create_new_download_file(std::path::Path::new(""), &name).await?
     };
-
-    let mut file = create_file_no_follow(&file_path).await?;
 
     let mut stream = response.bytes_stream();
     let mut total_bytes: u64 = 0;
@@ -5035,8 +5036,9 @@ fn get_value_type(val: &Value) -> &'static str {
 /// through anything that isn't a fresh-or-existing single-linked regular
 /// file the CWD-validated path points at directly.
 ///
-/// A server-controlled Content-Disposition filename or the predictable
-/// `download.<ext>` default could otherwise be aimed at a pre-planted:
+/// Used only for an operator-typed `--output` path (server-chosen names go
+/// through `create_new_download_file`, which never opens an existing file).
+/// A predictable output path could otherwise be aimed at a pre-planted:
 ///   * **symlink** — `voice.mp3 -> ~/.ssh/authorized_keys`. `O_NOFOLLOW`
 ///     in the open flags makes the kernel reject this atomically (`ELOOP`).
 ///   * **hardlink** — `download.mp3` (link count 2) sharing an inode with
@@ -5140,6 +5142,53 @@ async fn create_file_no_follow(file_path: &std::path::Path) -> Result<tokio::fs:
             .context("Failed to create output file")
             .map_err(Into::into)
     }
+}
+
+/// Upper bound on the `name (N).ext` suffixes tried before giving up.
+const MAX_DOWNLOAD_NAME_SUFFIX: u32 = 99;
+
+/// Create a brand-new file in `dir` for a download whose name the operator
+/// did not choose (server-supplied Content-Disposition or the
+/// `download.<ext>` default). Every open uses exclusive create (`O_EXCL`
+/// / `CREATE_NEW`), so an existing file — `package.json`, `Makefile`,
+/// `agents.json`, a previous download — is never opened, let alone
+/// truncated. When `name` is taken we try `name (1).ext` …
+/// `name (99).ext`, browser-style, and otherwise fail and point the
+/// operator at `--output`.
+async fn create_new_download_file(
+    dir: &std::path::Path,
+    name: &str,
+) -> Result<(PathBuf, tokio::fs::File), CliError> {
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => (&name[..i], &name[i..]),
+        _ => (name, ""),
+    };
+    for n in 0..=MAX_DOWNLOAD_NAME_SUFFIX {
+        let candidate = if n == 0 {
+            name.to_string()
+        } else {
+            format!("{stem} ({n}){ext}")
+        };
+        let path = dir.join(&candidate);
+        let mut opts = tokio::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        opts.custom_flags(libc::O_NOFOLLOW);
+        match opts.open(&path).await {
+            Ok(file) => return Ok((path, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(anyhow::Error::from(e)
+                    .context(format!("Failed to create output file '{}'", path.display()))
+                    .into());
+            }
+        }
+    }
+    Err(CliError::Validation(format!(
+        "Refused to save download as '{}': that name and {MAX_DOWNLOAD_NAME_SUFFIX} numbered \
+         variants already exist. Pass --output <path> to choose where to save it",
+        dir.join(name).display()
+    )))
 }
 
 /// Parse an RFC 6266 `Content-Disposition` value and return a sanitized
@@ -5311,10 +5360,37 @@ fn sanitize_server_supplied_filename(raw: &str) -> Option<String> {
         || basename == "."
         || basename == ".."
         || basename.starts_with('.')
+        || basename.ends_with('.')
+        || basename.ends_with(' ')
+        || is_windows_reserved_name(basename)
     {
         return None;
     }
     Some(basename.to_string())
+}
+
+/// Windows device names (`CON`, `NUL`, `COM1`, `LPT¹`, …) are reserved with
+/// or without an extension; opening `nul.mp3` there writes to the device.
+fn is_windows_reserved_name(basename: &str) -> bool {
+    let stem = basename
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(' ');
+    let upper = stem.to_ascii_uppercase();
+    if matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) {
+        return true;
+    }
+    let digit = upper
+        .strip_prefix("COM")
+        .or_else(|| upper.strip_prefix("LPT"));
+    match digit.map(|d| d.chars().collect::<Vec<_>>()).as_deref() {
+        Some([c]) => matches!(c, '0'..='9' | '\u{b9}' | '\u{b2}' | '\u{b3}'),
+        _ => false,
+    }
 }
 
 /// A character we will never accept in a server-supplied filename: ASCII
@@ -5327,8 +5403,19 @@ fn is_unsafe_filename_char(c: char) -> bool {
     }
     matches!(
         c,
+        // Windows-reserved punctuation; `:` also selects an NTFS alternate
+        // data stream (`notes.txt:evil`).
+        ':' | '<' | '>' | '"' | '|' | '?' | '*'
         // RFC 3987 bidi controls — LRM/RLM, LRE/RLE/PDF/LRO/RLO, isolates.
-        '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+        | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+        // Default-ignorable code points: invisible in displayed names and
+        // dropped by HFS+ when comparing names, so `pack\u{200B}age.json`
+        // would land on `package.json` there.
+        | '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{115F}' | '\u{1160}'
+        | '\u{17B4}' | '\u{17B5}' | '\u{180B}'..='\u{180F}' | '\u{200B}'..='\u{200D}'
+        | '\u{2060}'..='\u{2065}' | '\u{206A}'..='\u{206F}' | '\u{3164}'
+        | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}' | '\u{FFA0}' | '\u{FFF0}'..='\u{FFF8}'
+        | '\u{1BCA0}'..='\u{1BCA3}' | '\u{1D173}'..='\u{1D17A}' | '\u{E0000}'..='\u{E0FFF}'
     )
 }
 
@@ -12146,6 +12233,135 @@ mod tests {
             None
         );
         assert_eq!(sanitize_server_supplied_filename("a\\b.mp3"), None);
+    }
+
+    #[test]
+    fn test_sanitize_rejects_windows_unsafe_names() {
+        // NTFS alternate data stream / drive-relative paths.
+        assert_eq!(sanitize_server_supplied_filename("notes.txt:evil"), None);
+        assert_eq!(sanitize_server_supplied_filename("C:package.json"), None);
+        for bad in ["a<b", "a>b", "a\"b", "a|b", "a?b", "a*b"] {
+            assert_eq!(sanitize_server_supplied_filename(bad), None, "{bad}");
+        }
+        // Reserved device names, with or without extension, any case.
+        for bad in [
+            "CON",
+            "nul.mp3",
+            "Aux.json",
+            "com1.txt",
+            "LPT9",
+            "com\u{b9}.mp3",
+            "prn .txt",
+        ] {
+            assert_eq!(sanitize_server_supplied_filename(bad), None, "{bad}");
+        }
+        // Trailing dots and spaces are stripped by Windows, aliasing another name.
+        assert_eq!(sanitize_server_supplied_filename("package.json."), None);
+        assert_eq!(sanitize_server_supplied_filename("package.json "), None);
+        // Look-alikes that are not reserved still pass.
+        for ok in ["console.mp3", "com10.mp3", "nullable.wav", "lpt.mp3"] {
+            assert_eq!(
+                sanitize_server_supplied_filename(ok),
+                Some(ok.to_string()),
+                "{ok}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sanitize_rejects_default_ignorable_chars() {
+        // HFS+ ignores these when comparing names, so they would alias an
+        // existing file there while looking different everywhere else.
+        for c in [
+            '\u{200B}',
+            '\u{200C}',
+            '\u{200D}',
+            '\u{FEFF}',
+            '\u{00AD}',
+            '\u{2060}',
+            '\u{FE0F}',
+            '\u{E0041}',
+        ] {
+            let name = format!("pack{c}age.json");
+            assert_eq!(sanitize_server_supplied_filename(&name), None, "{c:?}");
+        }
+        assert_eq!(
+            sanitize_server_supplied_filename("\u{58f0}.mp3"),
+            Some("\u{58f0}.mp3".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_new_download_file_never_overwrites_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("package.json");
+        std::fs::write(&victim, b"original").unwrap();
+
+        let (path, mut file) = create_new_download_file(dir.path(), "package.json")
+            .await
+            .unwrap();
+        file.write_all(b"attacker").await.unwrap();
+        file.flush().await.unwrap();
+
+        assert_eq!(path, dir.path().join("package (1).json"));
+        assert_eq!(std::fs::read(&victim).unwrap(), b"original");
+        assert_eq!(std::fs::read(&path).unwrap(), b"attacker");
+
+        let (path2, _f) = create_new_download_file(dir.path(), "package.json")
+            .await
+            .unwrap();
+        assert_eq!(path2, dir.path().join("package (2).json"));
+
+        std::fs::write(dir.path().join("Makefile"), b"all:").unwrap();
+        let (path3, _f) = create_new_download_file(dir.path(), "Makefile")
+            .await
+            .unwrap();
+        assert_eq!(path3, dir.path().join("Makefile (1)"));
+        assert_eq!(std::fs::read(dir.path().join("Makefile")).unwrap(), b"all:");
+    }
+
+    #[tokio::test]
+    async fn test_create_new_download_file_fresh_name_used_as_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, _f) = create_new_download_file(dir.path(), "download.mp3")
+            .await
+            .unwrap();
+        assert_eq!(path, dir.path().join("download.mp3"));
+    }
+
+    #[tokio::test]
+    async fn test_create_new_download_file_fails_when_all_names_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.bin"), b"keep").unwrap();
+        for n in 1..=MAX_DOWNLOAD_NAME_SUFFIX {
+            std::fs::write(dir.path().join(format!("a ({n}).bin")), b"keep").unwrap();
+        }
+        match create_new_download_file(dir.path(), "a.bin").await {
+            Err(CliError::Validation(msg)) => assert!(msg.contains("--output"), "got: {msg}"),
+            other => panic!("expected Validation error, got: {other:?}"),
+        }
+        assert_eq!(std::fs::read(dir.path().join("a.bin")).unwrap(), b"keep");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_create_new_download_file_does_not_follow_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        std::fs::write(&target, b"keep").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("voice.mp3")).unwrap();
+        // Dangling symlink too: O_EXCL must not create through it.
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), dir.path().join("x.mp3")).unwrap();
+
+        let (path, _f) = create_new_download_file(dir.path(), "voice.mp3")
+            .await
+            .unwrap();
+        assert_eq!(path, dir.path().join("voice (1).mp3"));
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+
+        let (path, _f) = create_new_download_file(dir.path(), "x.mp3").await.unwrap();
+        assert_eq!(path, dir.path().join("x (1).mp3"));
+        assert!(!dir.path().join("nowhere").exists());
     }
 
     #[test]
