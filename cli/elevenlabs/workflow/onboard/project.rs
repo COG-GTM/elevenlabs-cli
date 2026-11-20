@@ -154,10 +154,11 @@ impl Project {
             ));
         }
         if env_file::is_tracked(&self.env_file) {
+            let tracked = env_file::tracked_display(name, &self.env_file);
             return Some(format!(
-                "git tracks {name}, so a key in it could be committed. Untrack it with `git rm --cached {}` (the file stays on disk), then try again. \
+                "git tracks {tracked}, so a key in {name} could be committed. Untrack it with `git rm --cached {}` (the file stays on disk), then try again. \
                  If it ever held a key that was pushed, replace that key too.",
-                shell_arg(name)
+                shell_arg(&tracked)
             ));
         }
         None

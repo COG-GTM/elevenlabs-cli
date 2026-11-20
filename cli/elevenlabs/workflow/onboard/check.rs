@@ -40,12 +40,13 @@ pub(super) fn verify(ctx: &AppContext, project: &Project, answered: bool) -> Res
     if let Some(file) = key.file(project) {
         let name = project.show(file);
         if env_file::is_tracked(file) {
+            let tracked = env_file::tracked_display(&name, file);
             return Ok(Reply::new(
                 Next::Fix,
                 format!(
-                    "git tracks {name}, so the key could be committed. Untrack it with `git rm --cached {}` \
+                    "git tracks {tracked}, so the key in {name} could be committed. Untrack it with `git rm --cached {}` \
                      (the file stays on disk). If it was ever committed and pushed, replace the key too.",
-                    shell_arg(&name)
+                    shell_arg(&tracked)
                 ),
             )
             .run(&project.next("check")));

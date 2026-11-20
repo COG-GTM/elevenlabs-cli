@@ -191,8 +191,45 @@ pub(super) fn nearest_dotenv(cwd: &Path) -> Option<(std::path::PathBuf, Option<S
     Some((path, key))
 }
 
+/// The name git tracks the file under, in the file's directory, when it tracks
+/// it. A tracked name that differs only by case counts: on a case-insensitive
+/// file system (the default on macOS and Windows) it is the same file, but git
+/// matches pathspecs case-sensitively even with `core.ignorecase`.
+pub(super) fn tracked_name(path: &Path) -> Option<String> {
+    let (dir, name) = split(path);
+    // `:(glob)*` lists the directory's own files, not those in subfolders.
+    let out = git_command()
+        .env_remove("GIT_LITERAL_PATHSPECS")
+        .env_remove("GIT_NOGLOB_PATHSPECS")
+        .env_remove("GIT_ICASE_PATHSPECS")
+        .arg("-C")
+        .arg(&dir)
+        .args(["ls-files", "-z", "--", ":(glob)*"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let folded = name.to_lowercase();
+    out.stdout
+        .split(|&b| b == 0)
+        .map(String::from_utf8_lossy)
+        .find(|tracked| tracked.to_lowercase() == folded)
+        .map(|tracked| tracked.into_owned())
+}
+
 pub(super) fn is_tracked(path: &Path) -> bool {
-    git(path, &["ls-files", "--error-unmatch"]) == Some(true)
+    tracked_name(path).is_some()
+}
+
+/// `shown`, the file as the developer sees it, with its name swapped for the
+/// one git tracks, for a `git rm --cached` that git understands.
+pub(super) fn tracked_display(shown: &str, path: &Path) -> String {
+    match tracked_name(path) {
+        Some(tracked) if Path::new(shown).file_name().is_some() => Path::new(shown)
+            .with_file_name(tracked)
+            .to_string_lossy()
+            .into_owned(),
+        _ => shown.to_string(),
+    }
 }
 
 /// Make git ignore the file, adding its name to the `.gitignore` in its
@@ -202,6 +239,13 @@ pub(super) fn is_tracked(path: &Path) -> bool {
 /// or already listed outside a repository). An error when git still doesn't
 /// ignore the file afterwards.
 pub(super) fn ensure_ignored(path: &Path) -> Result<bool, CliError> {
+    // A .gitignore line does nothing for a tracked file, whatever check-ignore says.
+    if let Some(tracked) = tracked_name(path) {
+        return Err(CliError::Validation(format!(
+            "git tracks {tracked}, so the key could be committed. Untrack it with `git rm --cached {}` (the file stays on disk).",
+            super::project::shell_arg(&tracked)
+        )));
+    }
     let in_repo = match git(path, &["check-ignore", "-q"]) {
         Some(true) => return Ok(false),
         Some(false) => true,
