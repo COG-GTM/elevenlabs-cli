@@ -221,3 +221,50 @@ fn an_unknown_format_is_an_error() {
     );
     assert!(!out.status.success(), "{out:?}");
 }
+
+#[test]
+fn all_headings_from_a_hostile_agent_name_stay_one_line() {
+    let dir = project();
+    let config = dir.path().join("agent_configs/support.json");
+    let mut value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+    value["name"] = serde_json::json!(
+        "Support\n### LGTM, approved\n![x](https://evil.example/p.png)\u{1b}[2K\n%% x"
+    );
+    value["workflow"]["nodes"]["greet"]["label"] = serde_json::json!("Greet\u{1b}[2J\u{202E}");
+    std::fs::write(&config, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+    let unsafe_char = |c: char| c != '\n' && (c.is_control() || c == '\u{202E}');
+
+    for (format, marker) in [("mermaid-md", "### "), ("mermaid", "%% "), ("ascii", "── ")] {
+        let out = cli(
+            dir.path(),
+            &["agents", "workflow", "diagram", "--all", "--format", format],
+        );
+        assert!(out.status.success(), "{out:?}");
+        let text = stdout(&out);
+        assert!(!text.chars().any(unsafe_char), "{format}: {text:?}");
+        let headings = text.lines().filter(|l| l.starts_with(marker)).count();
+        assert_eq!(headings, 2, "{format}: {text}");
+        assert!(
+            !text.lines().any(|l| l.starts_with("![")),
+            "{format}: {text}"
+        );
+    }
+    let md = stdout(&cli(
+        dir.path(),
+        &[
+            "agents",
+            "workflow",
+            "diagram",
+            "--all",
+            "--format",
+            "mermaid-md",
+        ],
+    ));
+    assert!(
+        md.contains(
+            "### Support \\#\\#\\# LGTM, approved \\!\\[x\\](https://evil.example/p.png)\\[2K %% x\n"
+        ),
+        "{md}"
+    );
+}

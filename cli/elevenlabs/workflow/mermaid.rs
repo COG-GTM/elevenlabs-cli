@@ -121,7 +121,7 @@ pub(super) fn truncate(text: &str, max: usize) -> String {
 pub(super) fn quote(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 2);
     out.push('"');
-    for c in text.chars() {
+    for c in terminal_safe(text).chars() {
         match c {
             '#' => out.push_str("#35;"),
             '"' => out.push_str("#quot;"),
@@ -129,7 +129,6 @@ pub(super) fn quote(text: &str) -> String {
             '>' => out.push_str("#gt;"),
             '|' => out.push_str("#124;"),
             '`' => out.push_str("#96;"),
-            '\n' | '\r' => out.push(' '),
             c => out.push(c),
         }
     }
@@ -142,12 +141,12 @@ pub(super) fn quote(text: &str) -> String {
 /// brackets (read as tags, like the `<br/>` that wraps lines) need replacing,
 /// and lookalikes keep the text readable.
 pub(super) fn plain(text: &str) -> String {
-    text.chars()
+    terminal_safe(text)
+        .chars()
         .map(|c| match c {
             '"' => '\'',
             '<' => '‹',
             '>' => '›',
-            '\n' | '\r' => ' ',
             c => c,
         })
         .collect()
@@ -173,9 +172,47 @@ pub(super) fn wrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// A node ID for a `%%` comment: one line, nothing else to escape.
+/// Text for a `%%` comment: one line, nothing else to escape.
 pub(super) fn comment_safe(id: &str) -> String {
-    id.replace(['\n', '\r'], " ")
+    terminal_safe(id)
+}
+
+/// `text` without control characters (an escape sequence in a name could
+/// otherwise clear or rewrite the terminal, with or without colour) and
+/// without the invisible or reordering Unicode that could disguise what is
+/// drawn: zero-width characters, bidi overrides and isolates, and line
+/// separators. Newlines and tabs become spaces, so the result is one line.
+/// The same policy as the CLI's own output sanitizer.
+pub(super) fn terminal_safe(text: &str) -> String {
+    text.chars()
+        .filter_map(|c| match c {
+            '\n' | '\r' | '\t' => Some(' '),
+            c if c.is_control() => None,
+            '\u{200B}'..='\u{200D}'
+            | '\u{FEFF}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2028}'..='\u{2029}'
+            | '\u{2066}'..='\u{2069}' => None,
+            c => Some(c),
+        })
+        .collect()
+}
+
+/// `text` as inline Markdown that reads literally, for after a heading's
+/// `### `: on one line, with every character that could start a link, image,
+/// emphasis, code span, HTML tag, entity, table cell or math backslash-escaped.
+pub(super) fn markdown_inline(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in terminal_safe(text).chars() {
+        if matches!(
+            c,
+            '\\' | '`' | '*' | '_' | '[' | ']' | '<' | '>' | '!' | '#' | '&' | '|' | '~' | '$'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Mermaid-safe node IDs.

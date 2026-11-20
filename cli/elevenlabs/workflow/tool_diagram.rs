@@ -28,8 +28,8 @@ use serde_json::Value;
 
 use super::agents::find_agent;
 use super::mermaid::{
-    fence, quote, str_field, terminal_width, truncate, use_color, Format, MermaidIds,
-    NODE_LABEL_MAX,
+    fence, quote, str_field, terminal_safe, terminal_width, truncate, use_color, Format,
+    MermaidIds, NODE_LABEL_MAX,
 };
 use super::{api, project};
 
@@ -238,27 +238,6 @@ fn span(text: impl Into<String>, tone: Tone) -> Span {
         text: terminal_safe(&text.into()),
         tone,
     }
-}
-
-/// `text` without control characters (an escape sequence in a tool name
-/// could otherwise clear or rewrite the terminal, with or without colour)
-/// and without the invisible or reordering Unicode that could disguise what
-/// is drawn: zero-width characters, bidi overrides and isolates, and line
-/// separators. Newlines and tabs become spaces, since a span is one line.
-/// The same policy as the CLI's own output sanitizer.
-fn terminal_safe(text: &str) -> String {
-    text.chars()
-        .filter_map(|c| match c {
-            '\n' | '\r' | '\t' => Some(' '),
-            c if c.is_control() => None,
-            '\u{200B}'..='\u{200D}'
-            | '\u{FEFF}'
-            | '\u{202A}'..='\u{202E}'
-            | '\u{2028}'..='\u{2029}'
-            | '\u{2066}'..='\u{2069}' => None,
-            c => Some(c),
-        })
-        .collect()
 }
 
 fn plain_text(spans: &[Span]) -> String {
