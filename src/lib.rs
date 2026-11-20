@@ -79,7 +79,8 @@ pub fn reset_sigpipe() {
 pub fn reset_sigpipe() {}
 
 /// Unscoped env vars a `.env` file may not set, because each one redirects
-/// traffic, weakens transport security, or names a program to execute.
+/// traffic, weakens transport security, names a program to execute, or moves
+/// the directory settings and credentials are read from.
 /// Matched ignoring case (see [`dotenv_key_is_denied`]).
 const DOTENV_DENIED_BARE: &[&str] = &[
     // Names a program the CLI executes when paging output.
@@ -96,6 +97,19 @@ const DOTENV_DENIED_BARE: &[&str] = &[
     "SSL_CERT_DIR",
     "CURL_CA_BUNDLE",
     "REQUESTS_CA_BUNDLE",
+    // Decide where `profiles.toml` and the file credential store live. A
+    // profile carries `base_url`, `proxy`, `insecure` and `ca_bundle`, and an
+    // active one outranks env, so a planted config dir would restore every
+    // setting this list blocks.
+    "HOME",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "XDG_CONFIG_HOME",
+    "APPDATA",
+    "LOCALAPPDATA",
+    // Swaps the OS keychain for the file store under that config dir.
+    "FERN_CLI_CREDENTIAL_STORE",
 ];
 
 /// Suffixes of `<PREFIX>_…` env vars a `.env` file may not set. Same
@@ -129,7 +143,7 @@ pub(crate) fn dotenv_key_is_denied(key: &str, prefix: &str) -> bool {
         .is_some_and(|rest| DOTENV_DENIED_SUFFIXES.contains(&rest))
 }
 
-/// Load `.env`, ignoring keys that control transport or execution.
+/// Load `.env`, ignoring keys that control transport, execution or the config dir.
 ///
 /// A generated CLI is routinely run inside repositories the operator did not
 /// write, and `dotenvy::dotenv()` searches the working directory and its
@@ -176,8 +190,9 @@ pub fn warn_ignored_dotenv_keys(ignored: &[String]) {
     for key in ignored {
         tracing::warn!(
             key = %key,
-            "ignoring {key} from .env: it controls transport or process execution, and a \
-             .env file is not a trusted source for it. Export it from your shell instead."
+            "ignoring {key} from .env: it controls transport, process execution or where \
+             settings and credentials are read from, and a .env file is not a trusted source \
+             for it. Export it from your shell instead."
         );
     }
 }
@@ -268,6 +283,36 @@ mod dotenv_filter_tests {
         assert!(!dotenv_key_is_denied("BASE_URL", "ELEVENLABS"));
         // Kebab-cased binary names map to underscored prefixes.
         assert!(dotenv_key_is_denied("MY_CLI_BASE_URL", "MY_CLI"));
+    }
+
+    #[test]
+    fn dotenv_cannot_move_the_config_or_credential_store() {
+        // Moving the config dir loads an attacker's `profiles.toml`, whose
+        // active profile sets `base_url` / `proxy` / `insecure` above env.
+        for key in [
+            "HOME",
+            "USERPROFILE",
+            "HOMEDRIVE",
+            "HOMEPATH",
+            "XDG_CONFIG_HOME",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "FERN_CLI_CREDENTIAL_STORE",
+            "home",
+            "xdg_config_home",
+            "AppData",
+            "LocalAppData",
+            "UserProfile",
+            "fern_cli_credential_store",
+        ] {
+            assert!(
+                dotenv_key_is_denied(key, "ELEVENLABS"),
+                "{key} must not be settable from .env"
+            );
+        }
+        // Profile selection by name still works: it only picks among the
+        // operator's own profiles.
+        assert!(!dotenv_key_is_denied("ELEVENLABS_PROFILE", "ELEVENLABS"));
     }
 
     #[test]
