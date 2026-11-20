@@ -405,11 +405,11 @@ fn arg_id_for(matches: &clap::ArgMatches, name: &str) -> Option<String> {
 }
 
 /// Read one parameter's value from the flags, the way the generated command
-/// does: JSON for object/array parameters (with `@file` references expanded),
+/// does: JSON for object/array parameters (with `@file` references expanded
+/// only under `--expand-file-refs`),
 /// `null` for nullable ones, enum display names mapped back to wire values,
 /// and repeated flags as a list.
 fn flag_value(
-    doc: &RestDescription,
     matches: &clap::ArgMatches,
     id: &str,
     param: &fern_cli_sdk::openapi::discovery::MethodParameter,
@@ -447,7 +447,7 @@ fn flag_value(
     }
     if matches!(param.param_type.as_deref(), Some("object" | "array")) {
         if let Ok(parsed) = serde_json::from_str(raw) {
-            return expand_file_refs(doc, parsed).map(Some);
+            return expand_file_refs(matches, parsed).map(Some);
         }
     }
     Ok(Some(Value::String(
@@ -470,7 +470,7 @@ fn block_on_local<T>(future: impl std::future::Future<Output = T>) -> T {
 /// The request the generated executor would send for `method`, built but not
 /// sent: exactly what `create --dry-run` prints. Going through
 /// `execute_method` gives this command the generated commands' parameter
-/// coercion, `@file` expansion in `--json`, `--json`/flag conflict check,
+/// coercion, `--json`/flag conflict check,
 /// required-field check and request-schema validation; the helpers behind
 /// them are `pub(crate)` in the framework.
 fn generated_dry_run(
@@ -517,23 +517,13 @@ fn generated_dry_run(
 }
 
 /// Expand `@file`, `@file://` and `@data://` references (and `\@` escapes)
-/// in an object or array flag's JSON, as the generated commands do. The
-/// framework's resolver is `pub(crate)`, so the value goes through the
-/// executor as the `--json` body of a bare method, which has no parameters
-/// or schema to check it against.
-fn expand_file_refs(doc: &RestDescription, value: Value) -> Result<Value, CliError> {
-    let bare = RestMethod {
-        http_method: "POST".to_string(),
-        ..RestMethod::default()
-    };
-    let preview = generated_dry_run(
-        doc,
-        Some("http://localhost"),
-        &bare,
-        None,
-        Some(&value.to_string()),
-    )?;
-    Ok(preview["body"].clone())
+/// in an object or array flag's JSON, as the generated commands do — only
+/// when the operator passed `--expand-file-refs`.
+fn expand_file_refs(matches: &clap::ArgMatches, mut value: Value) -> Result<Value, CliError> {
+    if fern_cli_sdk::openapi::executor::expand_file_refs_enabled(matches) {
+        fern_cli_sdk::openapi::executor::resolve_file_refs(&mut value)?;
+    }
+    Ok(value)
 }
 
 fn scalar_string(v: &Value) -> String {
@@ -558,7 +548,7 @@ fn build_request(
             continue;
         };
         let is_body = param.location.as_deref() == Some("body");
-        if let Some(v) = flag_value(doc, matches, &id, param, is_body && body_json.is_some())? {
+        if let Some(v) = flag_value(matches, &id, param, is_body && body_json.is_some())? {
             params.insert(name.clone(), v);
         }
     }
@@ -830,7 +820,10 @@ fn run(target: &Target, matches: &clap::ArgMatches, ctx: &AppContext) -> Result<
         )));
     };
 
-    let body_json = fern_cli_sdk::cli_args::resolve_body_json(matches)?;
+    let body_json = fern_cli_sdk::openapi::executor::expand_body_json_file_refs(
+        fern_cli_sdk::cli_args::resolve_body_json(matches)?,
+        fern_cli_sdk::openapi::executor::expand_file_refs_enabled(matches),
+    )?;
     let create = build_request(
         ctx.spec(),
         ctx.base_url_override(),
@@ -1308,6 +1301,11 @@ mod tests {
             .and_then(|g| g.find_subcommand("create"))
             .unwrap();
         let matches = sibling_command(target, create_cmd)
+            .arg(
+                clap::Arg::new(fern_cli_sdk::openapi::executor::EXPAND_FILE_REFS_FLAG)
+                    .long(fern_cli_sdk::openapi::executor::EXPAND_FILE_REFS_FLAG)
+                    .action(clap::ArgAction::SetTrue),
+            )
             .try_get_matches_from(std::iter::once("create-and-wait").chain(args.iter().copied()))
             .unwrap();
         let resource = resource_at(&doc, target.path).unwrap();
@@ -1331,17 +1329,22 @@ mod tests {
 
     #[test]
     fn file_references_are_expanded_like_create() {
-        let dir = std::env::temp_dir().join(format!("flows-wait-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let prompt = dir.join("prompt.txt");
+        // `@file` reads are confined to the working directory.
+        let dir = tempfile::Builder::new()
+            .prefix(".flows-wait-")
+            .tempdir_in(std::env::current_dir().unwrap())
+            .unwrap();
+        let prompt = dir.path().join("prompt.txt");
         std::fs::write(&prompt, "a corgi").unwrap();
         let prompt = prompt.to_str().unwrap();
+        let expand = "--expand-file-refs";
 
         // An object flag.
         let inputs = format!(
             r#"{{"prompt":"@file://{prompt}","image":"@data://{prompt}","note":"\\@literal"}}"#
         );
-        let req = run_request(&["--template-id", "tpl", "--inputs", &inputs], None).unwrap();
+        let req =
+            run_request(&[expand, "--template-id", "tpl", "--inputs", &inputs], None).unwrap();
         assert_eq!(
             req.body,
             Some(
@@ -1350,14 +1353,17 @@ mod tests {
         );
         assert_eq!(req.dry_run["body"], req.body.clone().unwrap());
 
-        // The whole `--json` body.
+        // The whole `--json` body, expanded by `run` before `build_request`.
         let body = format!(r#"{{"inputs":{{"prompt":"@file://{prompt}"}}}}"#);
-        let req = run_request(&["--template-id", "tpl"], Some(&body)).unwrap();
+        let body =
+            fern_cli_sdk::openapi::executor::expand_body_json_file_refs(Some(body), true).unwrap();
+        let req = run_request(&["--template-id", "tpl"], body.as_deref()).unwrap();
         assert_eq!(req.body, Some(json!({"inputs": {"prompt": "a corgi"}})));
 
         // A missing file fails before anything is sent.
         let missing = run_request(
             &[
+                expand,
                 "--template-id",
                 "tpl",
                 "--inputs",
@@ -1369,7 +1375,23 @@ mod tests {
             matches!(missing, Err(CliError::Validation(_))),
             "{missing:?}"
         );
-        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn file_references_are_sent_verbatim_without_opt_in() {
+        let inputs = r#"{"prompt":"@/etc/hostname"}"#;
+        let req = run_request(&["--template-id", "tpl", "--inputs", inputs], None).unwrap();
+        assert_eq!(
+            req.body,
+            Some(json!({"inputs": {"prompt": "@/etc/hostname"}}))
+        );
+
+        let body = r#"{"inputs":{"prompt":"@/etc/hostname"}}"#;
+        let req = run_request(&["--template-id", "tpl"], Some(body)).unwrap();
+        assert_eq!(
+            req.body,
+            Some(json!({"inputs": {"prompt": "@/etc/hostname"}}))
+        );
     }
 
     #[test]

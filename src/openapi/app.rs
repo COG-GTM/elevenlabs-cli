@@ -2979,6 +2979,7 @@ pub(crate) fn collect_params_from_flags(
     params_override: Option<&str>,
 ) -> Result<serde_json::Map<String, serde_json::Value>, CliError> {
     let mut params = serde_json::Map::new();
+    let expand_file_refs = executor::expand_file_refs_enabled(matched_args);
 
     // Collect values from individual flags. Three extensions interact here:
     //
@@ -3165,8 +3166,11 @@ pub(crate) fn collect_params_from_flags(
                             // Resolve `@filename` references inside nested
                             // string values — mirrors Stainless's CLI shorthand
                             // semantics (e.g. `--profile '{"pic":"@abe.jpg"}'`).
-                            // FER-10436.
-                            executor::resolve_file_refs(&mut parsed)?;
+                            // Opt-in only, so untrusted JSON text that starts
+                            // with `@` is never read from disk. FER-10436.
+                            if expand_file_refs {
+                                executor::resolve_file_refs(&mut parsed)?;
+                            }
                             parsed
                         }
                         Err(_) => serde_json::Value::String(value.clone()),
@@ -4365,6 +4369,66 @@ mod tests {
         let matches = cmd.get_matches_from(vec!["test", "--uuid", "abc-123"]);
         let result = collect_params_from_flags(&matches, &method, None).unwrap();
         assert_eq!(result.get("uuid").unwrap().as_str().unwrap(), "abc-123");
+    }
+
+    fn method_with_object_query_param() -> crate::openapi::discovery::RestMethod {
+        let mut params = std::collections::HashMap::new();
+        params.insert(
+            "filter".to_string(),
+            crate::openapi::discovery::MethodParameter {
+                param_type: Some("object".to_string()),
+                location: Some("query".to_string()),
+                ..Default::default()
+            },
+        );
+        crate::openapi::discovery::RestMethod {
+            parameters: params,
+            ..Default::default()
+        }
+    }
+
+    fn object_param_cmd() -> clap::Command {
+        clap::Command::new("test")
+            .arg(clap::Arg::new("filter").long("filter"))
+            .arg(clap::Arg::new("params").long("params"))
+            .arg(
+                clap::Arg::new(executor::EXPAND_FILE_REFS_FLAG)
+                    .long(executor::EXPAND_FILE_REFS_FLAG)
+                    .action(clap::ArgAction::SetTrue),
+            )
+    }
+
+    #[test]
+    fn test_security_object_flag_at_ref_is_not_read_by_default() {
+        let method = method_with_object_query_param();
+        let matches = object_param_cmd().get_matches_from(vec![
+            "test",
+            "--filter",
+            r#"{"pic":"@/etc/hostname"}"#,
+        ]);
+        let result = collect_params_from_flags(&matches, &method, None).unwrap();
+        assert_eq!(result["filter"]["pic"], serde_json::json!("@/etc/hostname"));
+    }
+
+    #[test]
+    fn test_object_flag_at_ref_expands_with_opt_in() {
+        let method = method_with_object_query_param();
+        let cwd = std::env::current_dir().unwrap();
+        let file = tempfile::Builder::new()
+            .prefix(".expand-file-refs-test-")
+            .tempfile_in(&cwd)
+            .unwrap();
+        std::fs::write(file.path(), b"from disk").unwrap();
+        let name = file.path().file_name().unwrap().to_str().unwrap();
+        let json = format!(r#"{{"pic":"@{name}"}}"#);
+        let matches = object_param_cmd().get_matches_from(vec![
+            "test",
+            "--expand-file-refs",
+            "--filter",
+            json.as_str(),
+        ]);
+        let result = collect_params_from_flags(&matches, &method, None).unwrap();
+        assert_eq!(result["filter"]["pic"], serde_json::json!("from disk"));
     }
 
     /// Method with one `const`-style body field carrying a clap default, plus a

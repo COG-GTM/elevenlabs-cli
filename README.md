@@ -529,6 +529,7 @@ These flags are available on every operation:
 |------|-------------|
 | `--dry-run` | Validate the request locally and print the HTTP request without sending it |
 | `--json <JSON\|->` | Supply a request body as JSON (or `-` to read stdin) |
+| `--expand-file-refs` | Read files named by `@<path>` string values in `--json` and JSON-valued flags (off by default; see [File references in JSON](#file-references-in-json)) |
 | `--params <JSON>` | Merge extra parameters as JSON (overrides individual flags) |
 | `--format <json\|table\|yaml\|csv>` | Output format (default `json`) |
 | `--output <PATH>` | Write binary responses to a file |
@@ -538,6 +539,22 @@ These flags are available on every operation:
 | `-q, --quiet` | Suppress stdout output on success (errors still go to stderr) |
 | `--intent <TEXT>` | Optional one-sentence description of what you are trying to do (see [Telling us what you are doing](#telling-us-what-you-are-doing)) |
 | `--telemetry <on\|off>` | Whether requests carry the anonymous platform tags (see [Telemetry](#telemetry)) |
+
+### File references in JSON
+
+`--json` bodies and JSON-valued object/array flags are sent verbatim: a string
+such as `"@/etc/hostname"` reaches the API as that literal text. To inline a
+local file, pass `--expand-file-refs`:
+
+```bash
+elevenlabs <resource> <method> --expand-file-refs --json '{"script": "@script.txt"}'
+```
+
+With the flag, `@<path>` inlines the file (UTF-8, or base64 for binary),
+`@file://<path>` requires UTF-8, `@data://<path>` always base64-encodes, and
+`\@text` sends the literal `@text`. Paths must be regular files inside the
+current directory (symlinks are resolved) and at most 50 MiB. Do not use the
+flag when the JSON contains text you did not write.
 
 ### Environment variables
 

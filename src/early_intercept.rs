@@ -11,6 +11,7 @@
 pub(crate) const BOOLEAN_FLAGS: &[&str] = &[
     "debug",
     "dry-run",
+    "expand-file-refs",
     "help",
     "no-extract",
     "no-pager",
