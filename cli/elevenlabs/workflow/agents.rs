@@ -473,15 +473,13 @@ fn handle_status(_args: NoArgs, _ctx: &AppContext) -> Result<(), CliError> {
         if let Some(version_id) = &agent.version_id {
             println!("   Version ID: {version_id}");
         }
-        let config_path = Path::new(&agent.config);
-        if !config_path.exists() {
-            println!("   Status: Config file not found");
-        } else {
-            match project::read_value(config_path) {
-                Ok(_) if agent.id.is_some() => println!("   Status: Created (use push to update)"),
-                Ok(_) => println!("   Status: Not pushed yet"),
-                Err(e) => println!("   Status: Config error: {e}"),
+        match read_existing_config(&agent.config) {
+            Ok(Some(_)) if agent.id.is_some() => {
+                println!("   Status: Created (use push to update)")
             }
+            Ok(Some(_)) => println!("   Status: Not pushed yet"),
+            Ok(None) => println!("   Status: Config file not found"),
+            Err(e) => println!("   Status: Config error: {e}"),
         }
     }
     Ok(())
@@ -547,15 +545,13 @@ fn handle_test(args: TestArgs, ctx: &AppContext) -> Result<(), CliError> {
         ))
     })?;
 
-    let config_path = Path::new(&agent.config);
-    if !config_path.exists() {
+    let Some(agent_config) = read_existing_config(&agent.config)? else {
         let name = agent_display_name(&agent.config);
         return Err(CliError::Validation(format!(
             "Config file not found for agent '{name}': {}",
             agent.config
         )));
-    }
-    let agent_config = project::read_value(config_path)?;
+    };
     let agent_name = agent_config
         .get("name")
         .and_then(Value::as_str)
@@ -1434,7 +1430,9 @@ fn config_to_write(
 /// yet. The extension selects JSON, YAML, or TOML.
 fn read_existing_config(path_str: &str) -> Result<Option<Value>, CliError> {
     let path = project::resolve_in_project(path_str)?;
-    if !path.is_file() {
+    // `symlink_metadata`, not `is_file`: a dangling symlink must reach the
+    // symlink refusal below rather than read as "not created yet".
+    if std::fs::symlink_metadata(&path).is_err() {
         return Ok(None);
     }
     project::read_value_in_project(path_str).map(Some)
