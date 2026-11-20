@@ -228,7 +228,7 @@ fn register_discovered(registry: &mut project::TestsConfig, config_dir: &str) ->
                 continue;
             }
         }
-        let config = match project::read_value(Path::new(&candidate)) {
+        let config = match project::read_value_in_project(&candidate) {
             Ok(v) => v,
             Err(e) => {
                 println!("Warning: Skipping unreadable test config {candidate}: {e}");
