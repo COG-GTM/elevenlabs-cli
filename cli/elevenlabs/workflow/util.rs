@@ -2,6 +2,7 @@
 //! the type-erased binding context and reading framework-global / string
 //! args from a clap match.
 
+use fern_cli_sdk::app::CliApp;
 use fern_cli_sdk::error::CliError;
 use fern_cli_sdk::openapi::AppContext;
 
@@ -20,6 +21,43 @@ pub fn dry_run_flag(matches: &clap::ArgMatches) -> bool {
         .flatten()
         .copied()
         .unwrap_or(false)
+}
+
+/// A typed handler that also receives the framework's global `--dry-run`.
+pub type DryRunHandler<A> = fn(A, bool, &AppContext) -> Result<(), CliError>;
+
+/// Typed registration that keeps the global `--dry-run`.
+///
+/// `CliApp::command_under_typed_with` hands the handler only the parsed args
+/// struct, so the global flag is silently dropped and a command that changes
+/// state would run for real under `--dry-run`. Any typed command that creates,
+/// deletes or runs something must register through this instead.
+pub trait DryRunCommands {
+    fn command_under_typed_dry_run<A: clap::Args + 'static>(
+        self,
+        path: &[&str],
+        cmd: clap::Command,
+        handler: DryRunHandler<A>,
+    ) -> Self;
+}
+
+impl DryRunCommands for CliApp {
+    fn command_under_typed_dry_run<A: clap::Args + 'static>(
+        self,
+        path: &[&str],
+        cmd: clap::Command,
+        handler: DryRunHandler<A>,
+    ) -> Self {
+        self.command_under(
+            path,
+            A::augment_args(cmd),
+            Box::new(move |matches, ctx| {
+                let args = A::from_arg_matches(matches)
+                    .map_err(|e| CliError::Validation(e.to_string()))?;
+                handler(args, dry_run_flag(matches), downcast_ctx(ctx)?)
+            }),
+        )
+    }
 }
 
 /// Read an optional string argument.

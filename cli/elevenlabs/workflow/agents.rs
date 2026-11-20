@@ -16,17 +16,19 @@ use fern_cli_sdk::openapi::AppContext;
 use serde_json::{json, Value};
 
 use super::config_format::{is_literal_key, ConfigFormat, FORMAT_NAMES};
-use super::util::{downcast_ctx, dry_run_flag, opt_string, plan_pull_action, PullAction};
+use super::util::{
+    downcast_ctx, dry_run_flag, opt_string, plan_pull_action, DryRunCommands, PullAction,
+};
 use super::{api, project, settings, templates, verify};
 
 /// Register the `agents` command group.
 pub fn register(app: CliApp) -> CliApp {
-    app.command_under_typed_with(
+    app.command_under_typed_dry_run(
         &["agents"],
         clap::Command::new("init").about("Initialize a new agent management project"),
         handle_init,
     )
-    .command_under_typed_with(
+    .command_under_typed_dry_run(
         &["agents"],
         clap::Command::new("add")
             .about("Add a new agent: create config, upload to ElevenLabs, and save its ID"),
@@ -57,7 +59,7 @@ pub fn register(app: CliApp) -> CliApp {
         clap::Command::new("embed").about("Print an embeddable HTML widget snippet for an agent"),
         handle_widget,
     )
-    .command_under_typed_with(
+    .command_under_typed_dry_run(
         &["agents"],
         clap::Command::new("test").about("Run the tests attached to an agent"),
         handle_test,
@@ -178,13 +180,35 @@ struct InitArgs {
 const GITIGNORE_BODY: &str =
     "# Credentials — never commit these. Use .env.example as the tracked template.\n.env\n";
 
-fn handle_init(args: InitArgs, _ctx: &AppContext) -> Result<(), CliError> {
+fn handle_init(args: InitArgs, dry_run: bool, _ctx: &AppContext) -> Result<(), CliError> {
     let _scope = api::command_scope("agents.init");
     let root = PathBuf::from(&args.path);
     let abs = std::env::current_dir()
         .map(|cwd| cwd.join(&root))
         .unwrap_or_else(|_| root.clone());
     println!("Initializing project in {}", abs.display());
+    if dry_run {
+        let verb = if args.r#override {
+            "overwrite"
+        } else {
+            "create (if missing)"
+        };
+        println!(
+            "[DRY RUN] Would {verb} {}, {} and {}",
+            project::AGENTS_FILE,
+            project::TOOLS_FILE,
+            project::TESTS_FILE
+        );
+        if args.r#override {
+            println!(
+                "  [DRY RUN] Would delete and recreate {}/, {}/ and {}/",
+                project::AGENT_CONFIGS_DIR,
+                project::TOOL_CONFIGS_DIR,
+                project::TEST_CONFIGS_DIR
+            );
+        }
+        return Ok(());
+    }
     if args.r#override {
         // --override recursively deletes the config directories, so confirm
         // first. A non-interactive run declines, which keeps an agent or a
@@ -342,7 +366,7 @@ struct AddArgs {
     config_format: Option<String>,
 }
 
-fn handle_add(args: AddArgs, ctx: &AppContext) -> Result<(), CliError> {
+fn handle_add(args: AddArgs, dry_run: bool, ctx: &AppContext) -> Result<(), CliError> {
     let _scope = api::command_scope("agents.add");
     if args.from_file.is_some() && args.template.is_some() {
         return Err(CliError::Validation(
@@ -416,6 +440,13 @@ fn handle_add(args: AddArgs, ctx: &AppContext) -> Result<(), CliError> {
     // Render before creating: a config the format can't hold (TOML needs an
     // object at the top) would otherwise leave a remote agent with no file.
     ConfigFormat::from_path(Path::new(&config_path)).render(&agent_config)?;
+
+    if dry_run {
+        println!("[DRY RUN] Would create agent '{agent_name}' in ElevenLabs");
+        println!("  [DRY RUN] Would write config file: {config_path}");
+        println!("  [DRY RUN] Would add it to {}", project::AGENTS_FILE);
+        return Ok(());
+    }
 
     // Create in ElevenLabs first to obtain an ID.
     println!("Creating agent '{agent_name}' in ElevenLabs...");
@@ -537,7 +568,7 @@ struct TestArgs {
     agent: String,
 }
 
-fn handle_test(args: TestArgs, ctx: &AppContext) -> Result<(), CliError> {
+fn handle_test(args: TestArgs, dry_run: bool, ctx: &AppContext) -> Result<(), CliError> {
     let _scope = api::command_scope("agents.test");
     let config = require_agents()?;
     let agent = find_agent(&config, &args.agent).ok_or_else(|| {
@@ -593,6 +624,14 @@ fn handle_test(args: TestArgs, ctx: &AppContext) -> Result<(), CliError> {
             "Agent '{agent_name}' has no id in agents.json. Run 'elevenlabs agents push' first."
         ))
     })?;
+    if dry_run {
+        println!(
+            "[DRY RUN] Would run {} test(s) on agent '{agent_name}' (ID: {agent_id}): {}",
+            test_ids.len(),
+            test_ids.join(", ")
+        );
+        return Ok(());
+    }
     let invocation = api::run_tests_on_agent(ctx, agent_id, &test_ids, None)?;
     let invocation_id = invocation
         .get("id")

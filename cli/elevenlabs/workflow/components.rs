@@ -7,6 +7,8 @@ use fern_cli_sdk::app::CliApp;
 use fern_cli_sdk::error::CliError;
 use fern_cli_sdk::openapi::AppContext;
 
+use super::util::DryRunCommands;
+
 const REGISTRY_BASE: &str = "https://ui.elevenlabs.io/r";
 
 /// Pinned rather than `@latest`: this runs `npx`, which downloads and executes
@@ -55,7 +57,7 @@ struct AddArgs {
     name: String,
 }
 
-fn handle_add(args: AddArgs, _ctx: &AppContext) -> Result<(), CliError> {
+fn handle_add(args: AddArgs, dry_run: bool, _ctx: &AppContext) -> Result<(), CliError> {
     validate_component(&args.name)?;
     let url = format!("{REGISTRY_BASE}/{}.json", args.name);
 
@@ -66,6 +68,10 @@ fn handle_add(args: AddArgs, _ctx: &AppContext) -> Result<(), CliError> {
     println!("Source: {url}\n");
 
     let (program, argv) = shadcn_argv(&url);
+    if dry_run {
+        println!("[DRY RUN] Would run: {program} {}", argv.join(" "));
+        return Ok(());
+    }
     // stdio is inherited so shadcn's interactive prompts work.
     let status = Command::new(program).args(&argv).status().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -85,7 +91,7 @@ fn handle_add(args: AddArgs, _ctx: &AppContext) -> Result<(), CliError> {
 
 /// Register the `components` command group.
 pub fn register(app: CliApp) -> CliApp {
-    app.command_under_typed_with(
+    app.command_under_typed_dry_run(
         &["components"],
         clap::Command::new("add").about("Add a component from the ElevenLabs UI registry"),
         handle_add,

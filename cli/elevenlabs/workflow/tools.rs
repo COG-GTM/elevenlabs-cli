@@ -9,18 +9,20 @@ use fern_cli_sdk::error::CliError;
 use fern_cli_sdk::openapi::AppContext;
 use serde_json::{json, Value};
 
-use super::util::{downcast_ctx, dry_run_flag, opt_string, plan_pull_action, PullAction};
+use super::util::{
+    downcast_ctx, dry_run_flag, opt_string, plan_pull_action, DryRunCommands, PullAction,
+};
 use super::{api, project, verify};
 
 /// Register the `tools` command group.
 pub fn register(app: CliApp) -> CliApp {
-    app.command_under_typed_with(
+    app.command_under_typed_dry_run(
         &["tools"],
         clap::Command::new("add")
             .about("Add a new tool: create config, upload to ElevenLabs, and save its ID"),
         handle_add,
     )
-    .command_under_typed_with(
+    .command_under_typed_dry_run(
         &["tools"],
         clap::Command::new("delete").about("Delete a tool locally and in ElevenLabs"),
         handle_delete,
@@ -110,7 +112,7 @@ struct AddArgs {
     config_path: Option<String>,
 }
 
-fn handle_add(args: AddArgs, ctx: &AppContext) -> Result<(), CliError> {
+fn handle_add(args: AddArgs, dry_run: bool, ctx: &AppContext) -> Result<(), CliError> {
     let _scope = api::command_scope("tools.add");
     let config = match args.tool_type.as_str() {
         "webhook" => default_webhook_tool(&args.name),
@@ -121,6 +123,21 @@ fn handle_add(args: AddArgs, ctx: &AppContext) -> Result<(), CliError> {
             )))
         }
     };
+
+    if dry_run {
+        let config_path = args.config_path.clone().unwrap_or_else(|| {
+            project::generate_unique_filename(project::TOOL_CONFIGS_DIR, &args.name, ".json")
+                .display()
+                .to_string()
+        });
+        println!(
+            "[DRY RUN] Would create {} tool '{}' in ElevenLabs",
+            args.tool_type, args.name
+        );
+        println!("  [DRY RUN] Would write config file: {config_path}");
+        println!("  [DRY RUN] Would add it to {}", project::TOOLS_FILE);
+        return Ok(());
+    }
 
     // Load or initialize tools.json.
     let mut registry = if Path::new(project::TOOLS_FILE).exists() {
@@ -183,7 +200,7 @@ struct DeleteArgs {
     yes: bool,
 }
 
-fn handle_delete(args: DeleteArgs, ctx: &AppContext) -> Result<(), CliError> {
+fn handle_delete(args: DeleteArgs, dry_run: bool, ctx: &AppContext) -> Result<(), CliError> {
     let _scope = api::command_scope("tools.delete");
     let mut registry = require_tools()?;
 
@@ -202,6 +219,14 @@ fn handle_delete(args: DeleteArgs, ctx: &AppContext) -> Result<(), CliError> {
                 i + 1,
                 tool.id.as_deref().unwrap_or("no id")
             );
+        }
+        if dry_run {
+            println!(
+                "\n[DRY RUN] Would delete {} tool(s) from ElevenLabs, their config files, and their {} entries",
+                registry.tools.len(),
+                project::TOOLS_FILE
+            );
+            return Ok(());
         }
         if !args.yes {
             println!(
@@ -253,6 +278,13 @@ fn handle_delete(args: DeleteArgs, ctx: &AppContext) -> Result<(), CliError> {
         })?;
     let removed = registry.tools.remove(index);
     let name = project::config_name(&removed.config).unwrap_or_else(|| tool_id.clone());
+
+    if dry_run {
+        println!("[DRY RUN] Would delete tool '{name}' (ID: {tool_id}) from ElevenLabs");
+        println!("  [DRY RUN] Would remove it from {}", project::TOOLS_FILE);
+        println!("  [DRY RUN] Would delete config file: {}", removed.config);
+        return Ok(());
+    }
 
     println!("Deleting tool '{name}' (ID: {tool_id})...");
     println!("Deleting from ElevenLabs...");

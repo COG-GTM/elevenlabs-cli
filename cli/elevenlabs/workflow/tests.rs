@@ -10,18 +10,20 @@ use fern_cli_sdk::error::CliError;
 use fern_cli_sdk::openapi::AppContext;
 use serde_json::{json, Value};
 
-use super::util::{downcast_ctx, dry_run_flag, opt_string, plan_pull_action, PullAction};
+use super::util::{
+    downcast_ctx, dry_run_flag, opt_string, plan_pull_action, DryRunCommands, PullAction,
+};
 use super::{api, project};
 
 /// Register the `tests` command group.
 pub fn register(app: CliApp) -> CliApp {
-    app.command_under_typed_with(
+    app.command_under_typed_dry_run(
         &["tests"],
         clap::Command::new("add")
             .about("Add a new test: create config, upload to ElevenLabs, and save its ID"),
         handle_add,
     )
-    .command_under_typed_with(
+    .command_under_typed_dry_run(
         &["tests"],
         clap::Command::new("delete").about("Delete a test locally and in ElevenLabs"),
         handle_delete,
@@ -276,9 +278,24 @@ struct AddArgs {
     config_path: Option<String>,
 }
 
-fn handle_add(args: AddArgs, ctx: &AppContext) -> Result<(), CliError> {
+fn handle_add(args: AddArgs, dry_run: bool, ctx: &AppContext) -> Result<(), CliError> {
     let _scope = api::command_scope("tests.add");
     let config = test_template_by_name(&args.name, &args.template)?;
+
+    if dry_run {
+        let config_path = args.config_path.clone().unwrap_or_else(|| {
+            project::generate_unique_filename(project::TEST_CONFIGS_DIR, &args.name, ".json")
+                .display()
+                .to_string()
+        });
+        println!(
+            "[DRY RUN] Would create test '{}' in ElevenLabs (template: {})",
+            args.name, args.template
+        );
+        println!("  [DRY RUN] Would write config file: {config_path}");
+        println!("  [DRY RUN] Would add it to {}", project::TESTS_FILE);
+        return Ok(());
+    }
 
     let mut registry = if Path::new(project::TESTS_FILE).exists() {
         project::load_tests()?
@@ -337,7 +354,7 @@ struct DeleteArgs {
     yes: bool,
 }
 
-fn handle_delete(args: DeleteArgs, ctx: &AppContext) -> Result<(), CliError> {
+fn handle_delete(args: DeleteArgs, dry_run: bool, ctx: &AppContext) -> Result<(), CliError> {
     let _scope = api::command_scope("tests.delete");
     let mut registry = require_tests()?;
 
@@ -356,6 +373,14 @@ fn handle_delete(args: DeleteArgs, ctx: &AppContext) -> Result<(), CliError> {
                 i + 1,
                 test.id.as_deref().unwrap_or("no id")
             );
+        }
+        if dry_run {
+            println!(
+                "\n[DRY RUN] Would delete {} test(s) from ElevenLabs, their config files, and their {} entries",
+                registry.tests.len(),
+                project::TESTS_FILE
+            );
+            return Ok(());
         }
         if !args.yes {
             println!(
@@ -407,6 +432,13 @@ fn handle_delete(args: DeleteArgs, ctx: &AppContext) -> Result<(), CliError> {
         })?;
     let removed = registry.tests.remove(index);
     let name = test_name_from_config(&removed.config).unwrap_or_else(|| test_id.clone());
+
+    if dry_run {
+        println!("[DRY RUN] Would delete test '{name}' (ID: {test_id}) from ElevenLabs");
+        println!("  [DRY RUN] Would remove it from {}", project::TESTS_FILE);
+        println!("  [DRY RUN] Would delete config file: {}", removed.config);
+        return Ok(());
+    }
 
     println!("Deleting test '{name}' (ID: {test_id})...");
     println!("Deleting from ElevenLabs...");
