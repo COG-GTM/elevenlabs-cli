@@ -133,6 +133,7 @@ pub fn spawn_pager(config: &PagerConfig, label: &str) -> Option<PagerHandle> {
     };
 
     let mut cmd = Command::new(program);
+    crate::without_dotenv_env(&mut cmd);
     cmd.args(extra_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())

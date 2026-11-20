@@ -170,6 +170,93 @@ async fn a_successful_request_streams_the_audio_to_the_player() {
     assert!(marker.exists(), "the player should have run");
 }
 
+/// A repository's `.env` is written by whoever wrote the repository. It may
+/// supply the API key, but it must not configure the programs the CLI starts:
+/// `LD_PRELOAD` would load the author's library into the player, `LESSOPEN`
+/// would make `less` run their command, and `HOME` would relocate the settings
+/// file that names the player.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn dotenv_values_never_reach_the_player() {
+    use std::os::unix::fs::PermissionsExt;
+    use wiremock::matchers::header;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v1/text-to-speech/{VOICE_ID}/stream")))
+        .and(header("xi-api-key", "key-from-dotenv"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(AUDIO))
+        .mount(&server)
+        .await;
+
+    let home = tempfile::tempdir().expect("tempdir");
+    let project = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        project.path().join(".env"),
+        "ELEVENLABS_API_KEY=key-from-dotenv\n\
+         LD_PRELOAD=/nonexistent/dotenv-preload.so\n\
+         LESSOPEN=|dotenv-lessopen %s\n\
+         HOME=/nonexistent/dotenv-home\n\
+         DOTENV_ONLY_MARKER=dotenv-marker-value\n",
+    )
+    .expect("write .env");
+
+    let env_dump = home.path().join("player.env");
+    let player = home.path().join("env-player");
+    std::fs::write(
+        &player,
+        format!(
+            "#!/bin/sh\ncat > /dev/null 2>&1\nenv > '{}'\n",
+            env_dump.display()
+        ),
+    )
+    .expect("write fake player");
+    std::fs::set_permissions(&player, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod fake player");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_elevenlabs"))
+        .current_dir(project.path())
+        .args([
+            "say",
+            "hello",
+            "--base-url",
+            &server.uri(),
+            "--player",
+            player.to_str().unwrap(),
+        ])
+        .env("HOME", home.path())
+        .env("NO_COLOR", "1")
+        .env("FERN_CLI_CREDENTIAL_STORE", "file")
+        .env_remove("ELEVENLABS_API_KEY")
+        .env_remove("ELEVENLABS_BASE_URL")
+        .env_remove("ELEVENLABS_VIA")
+        .env_remove("LD_PRELOAD")
+        .env_remove("LESSOPEN")
+        .env_remove("DOTENV_ONLY_MARKER")
+        .output()
+        .expect("failed to spawn the elevenlabs binary");
+
+    assert!(
+        out.status.success(),
+        "say failed (exit {:?}): {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let env = std::fs::read_to_string(&env_dump).expect("the player should have run");
+    for value in [
+        "key-from-dotenv",
+        "/nonexistent/dotenv-preload.so",
+        "dotenv-lessopen",
+        "/nonexistent/dotenv-home",
+        "dotenv-marker-value",
+    ] {
+        assert!(
+            !env.contains(value),
+            "{value} from .env reached the player's environment:\n{env}"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn the_response_body_is_written_verbatim_to_output() {
