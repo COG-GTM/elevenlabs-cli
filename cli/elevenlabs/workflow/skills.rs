@@ -254,22 +254,110 @@ fn skill_files(ctx: &AppContext) -> Result<Vec<(PathBuf, String)>, CliError> {
     Ok(files)
 }
 
+/// Write every skill file below `root` without following symlinks.
+///
+/// The output folder usually sits inside a checkout someone else wrote, so a
+/// planted `elevenlabs-shared/SKILL.md -> ~/.ssh/id_ed25519` (or a symlinked
+/// `elevenlabs-shared/`) would otherwise redirect the write outside it. Every
+/// directory below `root` must be a real directory, and the file itself is
+/// opened with `O_NOFOLLOW`.
 fn write_all(root: &Path, files: &[(PathBuf, String)]) -> Result<(), CliError> {
+    use std::io::Write;
+    std::fs::create_dir_all(root).map_err(|e| {
+        CliError::Validation(format!(
+            "Failed to create directory {}: {e}",
+            root.display()
+        ))
+    })?;
     for (rel_path, content) in files {
         let full_path = root.join(rel_path);
-        if let Some(parent) = full_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                CliError::Validation(format!(
-                    "Failed to create directory {}: {e}",
-                    parent.display()
-                ))
-            })?;
+        if let Some(parent) = rel_path.parent() {
+            ensure_real_dirs(root, parent)?;
         }
-        std::fs::write(&full_path, content).map_err(|e| {
+        let mut file = create_no_follow(&full_path)?;
+        file.write_all(content.as_bytes()).map_err(|e| {
             CliError::Validation(format!("Failed to write {}: {e}", full_path.display()))
         })?;
     }
     Ok(())
+}
+
+/// Create each directory of `rel_dir` under `root`, refusing any component
+/// that already exists as a symlink or as something other than a directory.
+fn ensure_real_dirs(root: &Path, rel_dir: &Path) -> Result<(), CliError> {
+    use std::path::Component;
+    let mut dir = root.to_path_buf();
+    for component in rel_dir.components() {
+        let Component::Normal(name) = component else {
+            return Err(CliError::Validation(format!(
+                "Refusing to write skill path {}: it is not a plain relative path",
+                rel_dir.display()
+            )));
+        };
+        dir.push(name);
+        match std::fs::symlink_metadata(&dir) {
+            Ok(meta) if meta.file_type().is_symlink() => return Err(symlink_refused(&dir)),
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => {
+                return Err(CliError::Validation(format!(
+                    "Failed to create directory {}: a file with that name already exists",
+                    dir.display()
+                )))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&dir).map_err(|e| {
+                    CliError::Validation(format!(
+                        "Failed to create directory {}: {e}",
+                        dir.display()
+                    ))
+                })?;
+            }
+            Err(e) => {
+                return Err(CliError::Validation(format!(
+                    "Failed to inspect {}: {e}",
+                    dir.display()
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Open a skill file for writing, refusing a symlink at the final component
+/// (including a dangling one, which would otherwise create its target).
+fn create_no_follow(path: &Path) -> Result<std::fs::File, CliError> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(not(unix))]
+    {
+        // No O_NOFOLLOW equivalent; check explicitly (racy, but better than nothing).
+        if let Ok(meta) = std::fs::symlink_metadata(path) {
+            if meta.file_type().is_symlink() {
+                return Err(symlink_refused(path));
+            }
+        }
+    }
+    opts.open(path).map_err(|e| {
+        // ELOOP is what O_NOFOLLOW returns for a symlink.
+        #[cfg(unix)]
+        if e.raw_os_error() == Some(libc::ELOOP) {
+            return symlink_refused(path);
+        }
+        CliError::Validation(format!("Failed to write {}: {e}", path.display()))
+    })
+}
+
+fn symlink_refused(path: &Path) -> CliError {
+    CliError::Validation(format!(
+        "Refusing to write through the symlink at {}: a symlink in the skills output \
+         folder can redirect writes outside it. Remove it and run generate-skills again.",
+        path.display()
+    ))
 }
 
 fn handle(matches: &clap::ArgMatches, ctx: &AppContext) -> Result<(), CliError> {
@@ -281,6 +369,8 @@ fn handle(matches: &clap::ArgMatches, ctx: &AppContext) -> Result<(), CliError> 
     // built-in did. Note it deliberately does not sandbox: it rejects control
     // characters and resolves the path, but the target may be anywhere on the
     // filesystem (see its docs). Shadowing neither adds nor removes that.
+    // What lies *inside* the folder is guarded by `write_all`, which refuses
+    // symlinks so a checkout cannot redirect individual skill files.
     let resolved = fern_cli_sdk::validate::validate_safe_output_dir(out_dir)?;
 
     let files = skill_files(ctx)?;
@@ -426,6 +516,83 @@ mod tests {
                 "{name}: SKILL.md must not reference sibling skills by relative \
                  path — the in-repo and generated layouts differ"
             );
+        }
+    }
+
+    #[cfg(unix)]
+    mod no_follow {
+        use super::super::write_all;
+        use std::os::unix::fs::symlink;
+        use std::path::PathBuf;
+
+        fn files() -> Vec<(PathBuf, String)> {
+            vec![(
+                PathBuf::from("elevenlabs-shared").join("SKILL.md"),
+                "generated\n".to_string(),
+            )]
+        }
+
+        #[test]
+        fn writes_into_real_directories() {
+            let out = tempfile::tempdir().unwrap();
+            write_all(out.path(), &files()).unwrap();
+            // Re-running overwrites the regular file in place.
+            write_all(out.path(), &files()).unwrap();
+            let written =
+                std::fs::read_to_string(out.path().join("elevenlabs-shared/SKILL.md")).unwrap();
+            assert_eq!(written, "generated\n");
+        }
+
+        #[test]
+        fn refuses_a_symlinked_skill_file() {
+            let out = tempfile::tempdir().unwrap();
+            let victim_dir = tempfile::tempdir().unwrap();
+            let victim = victim_dir.path().join("id_ed25519");
+            std::fs::write(&victim, "secret key").unwrap();
+            std::fs::create_dir(out.path().join("elevenlabs-shared")).unwrap();
+            symlink(&victim, out.path().join("elevenlabs-shared/SKILL.md")).unwrap();
+
+            let err = write_all(out.path(), &files()).unwrap_err().to_string();
+            assert!(
+                err.contains("Refusing to write through the symlink"),
+                "{err}"
+            );
+            assert_eq!(std::fs::read_to_string(&victim).unwrap(), "secret key");
+        }
+
+        #[test]
+        fn refuses_a_dangling_symlinked_skill_file() {
+            let out = tempfile::tempdir().unwrap();
+            let victim_dir = tempfile::tempdir().unwrap();
+            let victim = victim_dir.path().join("created-by-attacker");
+            std::fs::create_dir(out.path().join("elevenlabs-shared")).unwrap();
+            symlink(&victim, out.path().join("elevenlabs-shared/SKILL.md")).unwrap();
+
+            assert!(write_all(out.path(), &files()).is_err());
+            assert!(!victim.exists());
+        }
+
+        #[test]
+        fn refuses_a_symlinked_skill_directory() {
+            let out = tempfile::tempdir().unwrap();
+            let victim_dir = tempfile::tempdir().unwrap();
+            let victim = victim_dir.path().join("SKILL.md");
+            std::fs::write(&victim, "original").unwrap();
+            symlink(victim_dir.path(), out.path().join("elevenlabs-shared")).unwrap();
+
+            let err = write_all(out.path(), &files()).unwrap_err().to_string();
+            assert!(
+                err.contains("Refusing to write through the symlink"),
+                "{err}"
+            );
+            assert_eq!(std::fs::read_to_string(&victim).unwrap(), "original");
+        }
+
+        #[test]
+        fn refuses_a_file_where_a_skill_directory_belongs() {
+            let out = tempfile::tempdir().unwrap();
+            std::fs::write(out.path().join("elevenlabs-shared"), "not a dir").unwrap();
+            assert!(write_all(out.path(), &files()).is_err());
         }
     }
 }
