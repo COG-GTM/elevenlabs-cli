@@ -504,6 +504,53 @@ fn a_tracked_env_file_says_how_to_untrack_it() {
 }
 
 #[test]
+fn a_tracked_case_variant_of_the_env_file_counts_as_tracked() {
+    // On macOS and Windows `.env.local` opens the tracked `.ENV.LOCAL`, yet git
+    // matches `.env.local` case-sensitively, even with core.ignorecase.
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "-q"]);
+    git(dir.path(), &["config", "core.ignorecase", "true"]);
+    std::fs::write(dir.path().join(".ENV.LOCAL"), "A=1\n").unwrap();
+    git(dir.path(), &["add", ".ENV.LOCAL"]);
+    let env = dir.path().join(".env.local");
+    assert_eq!(
+        super::env_file::tracked_name(&env).as_deref(),
+        Some(".ENV.LOCAL")
+    );
+    let problem = project(dir.path()).env_file_problem().unwrap();
+    assert!(problem.contains("git rm --cached .ENV.LOCAL"), "{problem}");
+    let err = super::env_file::ensure_ignored(&env)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("git tracks .ENV.LOCAL"), "{err}");
+    assert!(
+        !dir.path().join(".gitignore").exists(),
+        "no gitignore line that can't help"
+    );
+
+    let p = super::project::Project::at(dir.path().to_path_buf(), Some("cfg/.env".into()));
+    std::fs::create_dir(dir.path().join("cfg")).unwrap();
+    std::fs::write(dir.path().join("cfg/.Env"), "A=1\n").unwrap();
+    git(dir.path(), &["add", "cfg/.Env"]);
+    let problem = p.env_file_problem().unwrap();
+    assert!(problem.contains("git rm --cached cfg/.Env"), "{problem}");
+}
+
+#[test]
+fn a_case_variant_in_a_subfolder_or_untracked_is_not_the_env_file() {
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "-q"]);
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub/.ENV.LOCAL"), "A=1\n").unwrap();
+    std::fs::write(dir.path().join(".env.local.example"), "A=\n").unwrap();
+    git(dir.path(), &["add", "."]);
+    std::fs::write(dir.path().join(".ENV.LOCAL"), "A=1\n").unwrap();
+    let env = dir.path().join(".env.local");
+    assert_eq!(super::env_file::tracked_name(&env), None);
+    assert!(project(dir.path()).env_file_problem().is_none());
+}
+
+#[test]
 fn the_shell_wins_then_the_env_file_then_a_dotenv_up_the_tree() {
     use super::project::KeySource;
     let root = tempfile::tempdir().unwrap();
