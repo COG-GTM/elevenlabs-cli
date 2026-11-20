@@ -8,6 +8,8 @@ use serde_json::Value;
 use std::fmt::Write;
 use std::io::IsTerminal;
 
+use crate::output::{is_dangerous_unicode, sanitize_for_terminal};
+
 /// Color emission mode.
 ///
 /// Resolved from CLI flags and environment in [`OutputPipeline::from_matches`].
@@ -162,6 +164,7 @@ impl OutputPipeline {
         } else {
             format_value(effective, &self.format)
         };
+        let rendered = self.finish_for_stdout(rendered);
         writeln!(out, "{rendered}")?;
         Ok(())
     }
@@ -192,6 +195,7 @@ impl OutputPipeline {
             OutputFormat::Table => format_record_table(effective),
             _ => format_value(effective, &self.format),
         };
+        let rendered = self.finish_for_stdout(rendered);
         writeln!(out, "{rendered}")?;
         Ok(())
     }
@@ -215,8 +219,13 @@ impl OutputPipeline {
         } else {
             format_value(value, &self.format)
         };
+        let rendered = self.finish_for_stdout(rendered);
         writeln!(out, "{rendered}")?;
         Ok(())
+    }
+
+    fn finish_for_stdout(&self, rendered: String) -> String {
+        sanitize_rendered_for_terminal(&self.format, rendered, std::io::stdout().is_terminal())
     }
 
     /// Apply the `--query` JMESPath expression to `value`.
@@ -269,6 +278,24 @@ fn resolve_default_format(env_value: Option<&str>, stdout_is_terminal: bool) -> 
         OutputFormat::Table
     } else {
         OutputFormat::Json
+    }
+}
+
+/// Strip terminal control sequences from CSV output bound for a terminal.
+///
+/// CSV has no escape syntax for control characters, so they are removed only
+/// when a person is looking at the output; piped CSV keeps the exact data.
+/// Table cells are sanitized while rendering (so column widths stay right)
+/// and YAML escapes them losslessly, so neither needs a pass here.
+fn sanitize_rendered_for_terminal(
+    format: &OutputFormat,
+    rendered: String,
+    stdout_is_terminal: bool,
+) -> String {
+    if stdout_is_terminal && *format == OutputFormat::Csv {
+        sanitize_for_terminal(&rendered)
+    } else {
+        rendered
     }
 }
 
@@ -491,7 +518,11 @@ fn format_record_table(value: &Value) -> String {
         return format_table(value);
     };
     let flat = flatten_record(obj, "");
-    let max_key_len = flat.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    let max_key_len = flat
+        .iter()
+        .map(|(k, _)| k.chars().count())
+        .max()
+        .unwrap_or(0);
     let mut output = String::new();
     for (key, val_str) in &flat {
         let _ = writeln!(output, "{key:max_key_len$}  {val_str}");
@@ -502,8 +533,9 @@ fn format_record_table(value: &Value) -> String {
 fn flatten_record(obj: &serde_json::Map<String, Value>, prefix: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for (key, val) in obj {
+        let key = sanitize_for_terminal(key);
         let full_key = if prefix.is_empty() {
-            key.clone()
+            key
         } else {
             format!("{prefix}.{key}")
         };
@@ -512,14 +544,13 @@ fn flatten_record(obj: &serde_json::Map<String, Value>, prefix: &str) -> Vec<(St
                 out.extend(flatten_record(nested, &full_key))
             }
             Value::Array(arr) if !arr.is_empty() => match as_name_value_pairs(arr) {
-                Some(pairs) => out.extend(
-                    pairs
-                        .into_iter()
-                        .map(|(name, value)| (format!("{full_key}.{name}"), value_to_cell(value))),
-                ),
-                None => out.push((full_key, value_to_cell(val))),
+                Some(pairs) => out.extend(pairs.into_iter().map(|(name, value)| {
+                    let name = sanitize_for_terminal(name);
+                    (format!("{full_key}.{name}"), table_cell(value))
+                })),
+                None => out.push((full_key, table_cell(val))),
             },
-            _ => out.push((full_key, value_to_cell(val))),
+            _ => out.push((full_key, table_cell(val))),
         }
     }
     out
@@ -542,8 +573,9 @@ fn as_name_value_pairs(arr: &[Value]) -> Option<Vec<(&str, &Value)>> {
 fn flatten_object(obj: &serde_json::Map<String, Value>, prefix: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for (key, val) in obj {
+        let key = sanitize_for_terminal(key);
         let full_key = if prefix.is_empty() {
-            key.clone()
+            key
         } else {
             format!("{prefix}.{key}")
         };
@@ -552,7 +584,7 @@ fn flatten_object(obj: &serde_json::Map<String, Value>, prefix: &str) -> Vec<(St
                 out.extend(flatten_object(nested, &full_key));
             }
             _ => {
-                out.push((full_key, value_to_cell(val)));
+                out.push((full_key, table_cell(val)));
             }
         }
     }
@@ -576,7 +608,11 @@ fn format_table_page(value: &Value, emit_header: bool) -> String {
         // Single object: key/value table — flatten nested objects first
         let mut output = String::new();
         let flat = flatten_object(obj, "");
-        let max_key_len = flat.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+        let max_key_len = flat
+            .iter()
+            .map(|(k, _)| k.chars().count())
+            .max()
+            .unwrap_or(0);
         for (key, val_str) in &flat {
             let _ = writeln!(output, "{key:max_key_len$}  {val_str}");
         }
@@ -596,7 +632,7 @@ fn format_array_as_table(arr: &[Value], emit_header: bool) -> String {
         .iter()
         .map(|item| match item {
             Value::Object(obj) => flatten_object(obj, ""),
-            _ => vec![(String::new(), value_to_cell(item))],
+            _ => vec![(String::new(), table_cell(item))],
         })
         .collect();
 
@@ -614,7 +650,7 @@ fn format_array_as_table(arr: &[Value], emit_header: bool) -> String {
         // Array of non-objects
         let mut output = String::new();
         for item in arr {
-            let _ = writeln!(output, "{}", value_to_cell(item));
+            let _ = writeln!(output, "{}", table_cell(item));
         }
         return output;
     }
@@ -710,7 +746,11 @@ fn json_to_yaml(value: &Value, indent: usize) -> String {
         Value::Bool(b) => b.to_string(),
         Value::Number(n) => n.to_string(),
         Value::String(s) => {
-            if s.contains('\n') {
+            if s.chars().any(needs_yaml_escape) {
+                // Control or invisible characters: escape them so the terminal
+                // never receives them raw. `\xNN`/`\uNNNN` keep the value exact.
+                yaml_quoted(s)
+            } else if s.contains('\n') {
                 // Genuine multi-line content: block scalar is the most readable choice.
                 format!(
                     "|\n{}",
@@ -754,6 +794,7 @@ fn json_to_yaml(value: &Value, indent: usize) -> String {
             }
             let mut out = String::new();
             for (key, val) in obj {
+                let key = yaml_key(key);
                 match val {
                     Value::Object(_) | Value::Array(_) => {
                         let val_str = json_to_yaml(val, indent + 1);
@@ -773,6 +814,47 @@ fn json_to_yaml(value: &Value, indent: usize) -> String {
             }
             out
         }
+    }
+}
+
+/// Characters that must not reach the terminal raw from a YAML scalar.
+fn needs_yaml_escape(c: char) -> bool {
+    (c.is_control() && c != '\n' && c != '\t') || is_dangerous_unicode(c)
+}
+
+/// Double-quoted YAML scalar with every control and invisible character
+/// written as an escape sequence.
+fn yaml_quoted(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            c if needs_yaml_escape(c) => {
+                let cp = c as u32;
+                if cp <= 0xFF {
+                    let _ = write!(out, "\\x{cp:02X}");
+                } else {
+                    let _ = write!(out, "\\u{cp:04X}");
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Mapping key: emitted as-is unless it holds characters that would break the
+/// line structure or reach the terminal raw, in which case it is quoted.
+fn yaml_key(key: &str) -> std::borrow::Cow<'_, str> {
+    if key.chars().any(|c| c == '\n' || needs_yaml_escape(c)) {
+        std::borrow::Cow::Owned(yaml_quoted(key))
+    } else {
+        std::borrow::Cow::Borrowed(key)
     }
 }
 
@@ -860,6 +942,11 @@ fn csv_escape(s: &str) -> String {
     } else {
         s.to_string()
     }
+}
+
+/// Table cell text with terminal control and invisible characters removed.
+fn table_cell(value: &Value) -> String {
+    sanitize_for_terminal(&value_to_cell(value))
 }
 
 fn value_to_cell(value: &Value) -> String {
@@ -2019,6 +2106,129 @@ mod tests {
         let first = format_value_paginated(&val, &OutputFormat::Http, true);
         let second = format_value_paginated(&val, &OutputFormat::Http, false);
         assert!(!first.contains('\n'));
-        assert_eq!(first, second, "http paginated fallback ignores is_first_page");
+        assert_eq!(
+            first, second,
+            "http paginated fallback ignores is_first_page"
+        );
+    }
+
+    // ── Terminal escape injection (control characters from API strings) ──
+
+    fn assert_no_terminal_controls(output: &str) {
+        for c in output.chars() {
+            assert!(
+                c == '\n' || c == '\t' || !(c.is_control() || is_dangerous_unicode(c)),
+                "output contains raw control/invisible char {:?}: {output:?}",
+                c
+            );
+        }
+    }
+
+    #[test]
+    fn table_list_strips_escape_sequences_from_cells_and_keys() {
+        let val = json!({"voices": [
+            {"name": "\u{001b}[2Jname", "\u{001b}]0;pwned\u{0007}id": "v1"},
+            {"name": "ok\u{202E}gpj.exe", "\u{001b}]0;pwned\u{0007}id": "v2"}
+        ]});
+        let output = format_value(&val, &OutputFormat::Table);
+        assert_no_terminal_controls(&output);
+        assert!(output.contains("[2Jname"), "visible text kept: {output}");
+        assert!(output.contains("]0;pwnedid"), "key text kept: {output}");
+    }
+
+    #[test]
+    fn table_list_widths_ignore_stripped_characters() {
+        let val = json!([{"name": "\u{001b}[31mred", "n": 7}, {"name": "plain", "n": 8}]);
+        let output = format_value(&val, &OutputFormat::Table);
+        assert_no_terminal_controls(&output);
+        let lines: Vec<&str> = output.lines().collect();
+        // header, separator, two rows; all rows align on the same column.
+        assert_eq!(
+            lines[2].chars().position(|c| c == '7'),
+            lines[3].chars().position(|c| c == '8')
+        );
+    }
+
+    #[test]
+    fn table_single_object_strips_escape_sequences() {
+        let val = json!({"message": "\u{001b}[2Jname", "nested": {"\u{009b}k": "\u{001b}[1A"}});
+        let output = format_value(&val, &OutputFormat::Table);
+        assert_no_terminal_controls(&output);
+        assert!(output.contains("[2Jname"));
+    }
+
+    #[test]
+    fn record_table_strips_escape_sequences() {
+        let val = json!({"headers": [["x-\u{001b}[2J", "\u{001b}]52;c;Zm9v\u{0007}"]], "url": "\u{001b}[2Jhttps://x"});
+        let output = format_record_table(&val);
+        assert_no_terminal_controls(&output);
+        assert!(output.contains("headers.x-[2J"));
+    }
+
+    #[test]
+    fn table_paginated_strips_escape_sequences() {
+        let val = json!({"items": [{"text": "\u{001b}[2Jhi"}]});
+        let output = format_value_paginated(&val, &OutputFormat::Table, false);
+        assert_no_terminal_controls(&output);
+    }
+
+    #[test]
+    fn yaml_escapes_control_characters_losslessly() {
+        let val =
+            json!({"name": "\u{001b}[2Jname", "bidi": "a\u{202E}b", "multi": "l1\n\u{001b}[1Al2"});
+        let output = format_value(&val, &OutputFormat::Yaml);
+        assert_no_terminal_controls(&output);
+        assert!(output.contains(r#"name: "\x1B[2Jname""#), "got: {output}");
+        assert!(output.contains(r#"bidi: "a\u202Eb""#), "got: {output}");
+        assert!(
+            output.contains(r#"multi: "l1\n\x1B[1Al2""#),
+            "got: {output}"
+        );
+    }
+
+    #[test]
+    fn yaml_quotes_keys_with_control_characters() {
+        let val = json!({"\u{001b}]0;t\u{0007}key": 1, "plain": 2});
+        let output = format_value(&val, &OutputFormat::Yaml);
+        assert_no_terminal_controls(&output);
+        assert!(output.contains(r#""\x1B]0;t\x07key": 1"#), "got: {output}");
+        assert!(
+            output.contains("plain: 2"),
+            "plain keys unchanged: {output}"
+        );
+    }
+
+    #[test]
+    fn yaml_plain_strings_unchanged() {
+        let val = json!({"a": "x: y # z", "b": "line1\nline2"});
+        let output = format_value(&val, &OutputFormat::Yaml);
+        assert_eq!(output, "a: \"x: y # z\"\nb: |\n  line1\n  line2");
+    }
+
+    #[test]
+    fn csv_to_terminal_strips_escape_sequences() {
+        let val = json!([{"\u{001b}[2Jcol": "\u{001b}]0;t\u{0007}v,1"}]);
+        let rendered = format_value(&val, &OutputFormat::Csv);
+        let output = sanitize_rendered_for_terminal(&OutputFormat::Csv, rendered, true);
+        assert_no_terminal_controls(&output);
+        assert_eq!(output, "[2Jcol\n\"]0;tv,1\"\n");
+    }
+
+    #[test]
+    fn csv_piped_keeps_exact_data() {
+        let val = json!([{"col": "\u{001b}[2Jv"}]);
+        let rendered = format_value(&val, &OutputFormat::Csv);
+        let output = sanitize_rendered_for_terminal(&OutputFormat::Csv, rendered.clone(), false);
+        assert_eq!(output, rendered);
+        assert!(output.contains('\u{001b}'));
+    }
+
+    #[test]
+    fn json_output_is_not_altered_for_terminal() {
+        let val = json!({"name": "\u{001b}[2Jname"});
+        let rendered = format_value(&val, &OutputFormat::Json);
+        let output = sanitize_rendered_for_terminal(&OutputFormat::Json, rendered.clone(), true);
+        assert_eq!(output, rendered);
+        assert!(output.contains("\\u001b"));
     }
 }
