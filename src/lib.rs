@@ -79,7 +79,8 @@ pub fn reset_sigpipe() {
 pub fn reset_sigpipe() {}
 
 /// Unscoped env vars a `.env` file may not set, because each one redirects
-/// traffic, weakens transport security, or names a program to execute.
+/// traffic, weakens transport security, names a program to execute, or
+/// decides where sign-in credentials are stored.
 /// Matched ignoring case (see [`dotenv_key_is_denied`]).
 const DOTENV_DENIED_BARE: &[&str] = &[
     // Names a program the CLI executes when paging output.
@@ -96,6 +97,14 @@ const DOTENV_DENIED_BARE: &[&str] = &[
     "SSL_CERT_DIR",
     "CURL_CA_BUNDLE",
     "REQUESTS_CA_BUNDLE",
+    // Force the plaintext file credential store instead of the OS keychain.
+    "FERN_CLI_CREDENTIAL_STORE",
+    // Move the config directory, and with it the credential file, into the
+    // project (or let the project plant a token file of its own).
+    "XDG_CONFIG_HOME",
+    "HOME",
+    "USERPROFILE",
+    "APPDATA",
 ];
 
 /// Suffixes of `<PREFIX>_…` env vars a `.env` file may not set. Same
@@ -176,8 +185,9 @@ pub fn warn_ignored_dotenv_keys(ignored: &[String]) {
     for key in ignored {
         tracing::warn!(
             key = %key,
-            "ignoring {key} from .env: it controls transport or process execution, and a \
-             .env file is not a trusted source for it. Export it from your shell instead."
+            "ignoring {key} from .env: it controls transport, process execution or credential \
+             storage, and a .env file is not a trusted source for it. Export it from your shell \
+             instead."
         );
     }
 }
@@ -238,6 +248,27 @@ mod dotenv_filter_tests {
             "elevenlabs_base_url",
             "Elevenlabs_Insecure",
             "browser",
+        ] {
+            assert!(
+                dotenv_key_is_denied(key, "ELEVENLABS"),
+                "{key} must not be settable from .env"
+            );
+        }
+    }
+
+    #[test]
+    fn credential_store_keys_are_denied_from_dotenv() {
+        // Otherwise a `.env` could swap the OS keychain for a plaintext file
+        // inside the project, or plant a token file the CLI then signs in with.
+        for key in [
+            "FERN_CLI_CREDENTIAL_STORE",
+            "XDG_CONFIG_HOME",
+            "HOME",
+            "USERPROFILE",
+            "APPDATA",
+            "fern_cli_credential_store",
+            "xdg_config_home",
+            "AppData",
         ] {
             assert!(
                 dotenv_key_is_denied(key, "ELEVENLABS"),
