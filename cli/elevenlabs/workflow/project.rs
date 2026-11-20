@@ -309,8 +309,13 @@ fn restrict_permissions(file: &std::fs::File) {
 
 // ── Config IO ───────────────────────────────────────────────────────
 
+/// Largest config or index file read, so a huge file can't exhaust memory.
+pub const MAX_CONFIG_BYTES: u64 = 8 * 1024 * 1024;
+
 fn read_text(path: &Path) -> Result<String, CliError> {
-    std::fs::read_to_string(path).map_err(|e| {
+    use std::io::Read;
+
+    let io_error = |e: std::io::Error| {
         if e.kind() == std::io::ErrorKind::NotFound {
             CliError::Validation(format!(
                 "Configuration file not found at {}",
@@ -319,7 +324,21 @@ fn read_text(path: &Path) -> Result<String, CliError> {
         } else {
             CliError::Other(anyhow::anyhow!("Could not read {}: {e}", path.display()))
         }
-    })
+    };
+    let mut text = String::new();
+    std::fs::File::open(path)
+        .map_err(io_error)?
+        .take(MAX_CONFIG_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(io_error)?;
+    if text.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(CliError::Validation(format!(
+            "Configuration file {} is larger than the {} MiB limit",
+            path.display(),
+            MAX_CONFIG_BYTES / (1024 * 1024)
+        )));
+    }
+    Ok(text)
 }
 
 /// Read and deserialize a JSON file, with v0-style error messages.
@@ -599,6 +618,23 @@ mod tests {
         let result = body(&root);
         let _ = std::env::set_current_dir(previous);
         result
+    }
+
+    #[test]
+    fn oversized_config_files_are_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let big = dir.path().join("big.yaml");
+        let file = std::fs::File::create(&big).unwrap();
+        file.set_len(MAX_CONFIG_BYTES + 1).unwrap();
+        let err = read_value(&big).unwrap_err().to_string();
+        assert!(err.contains("larger than the 8 MiB limit"), "{err}");
+
+        let at_limit = dir.path().join("ok.json");
+        let mut text = String::from("\"");
+        text.push_str(&"a".repeat(MAX_CONFIG_BYTES as usize - 2));
+        text.push('"');
+        std::fs::write(&at_limit, &text).unwrap();
+        assert!(read_value(&at_limit).is_ok());
     }
 
     #[test]

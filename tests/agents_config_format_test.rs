@@ -313,6 +313,42 @@ fn a_bad_toml_config_names_the_format() {
     );
 }
 
+#[test]
+fn a_yaml_alias_bomb_is_refused_quickly() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir = dir.path();
+    // About 26 KB that expands to 5 billion values if aliases are followed.
+    let text = format!(
+        "a: &a [{}]\nb: &b [{}]\nc: [{}]\n",
+        vec!["x"; 5_000].join(","),
+        vec!["*a"; 5_000].join(","),
+        vec!["*b"; 200].join(",")
+    );
+    std::fs::write(dir.join("bomb.yaml"), text).unwrap();
+    let started = std::time::Instant::now();
+    let out = cli(
+        dir,
+        "http://127.0.0.1:9",
+        &["agents", "workflow", "diagram", "bomb.yaml"],
+    );
+    assert!(!out.status.success());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "took {:?}",
+        started.elapsed()
+    );
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        text.contains("Invalid YAML in configuration file"),
+        "{text}"
+    );
+    assert!(text.contains("aliases are expanded"), "{text}");
+}
+
 #[tokio::test]
 async fn a_config_toml_cannot_hold_does_not_lose_the_others() {
     let server = MockServer::start().await;

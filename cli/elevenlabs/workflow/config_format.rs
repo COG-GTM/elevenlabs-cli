@@ -17,9 +17,12 @@
 //! plain array of objects, and any null within a free-form JSON value such as
 //! a tool parameter's `constant_value` (see [`LITERAL_KEYS`]).
 
+use std::cell::Cell;
+use std::fmt;
 use std::path::Path;
 
 use fern_cli_sdk::error::CliError;
+use serde::de::{self, DeserializeSeed, IgnoredAny, Visitor};
 use serde_json::{Map, Value};
 use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table};
 
@@ -80,6 +83,7 @@ impl ConfigFormat {
         match self {
             Self::Json => serde_json::from_str(text).map_err(|e| e.to_string()),
             Self::Yaml => {
+                check_yaml_size(text)?;
                 let yaml: serde_yaml::Value =
                     serde_yaml::from_str(text).map_err(|e| e.to_string())?;
                 check_yaml_numbers(&yaml, "")?;
@@ -105,6 +109,117 @@ impl ConfigFormat {
 }
 
 // ── YAML → JSON ─────────────────────────────────────────────────────
+
+/// Most values a YAML config may hold once its aliases are expanded.
+/// `serde_yaml` copies the anchored node for every alias, so a few KB of
+/// nested aliases can otherwise expand to billions of values.
+pub const MAX_YAML_NODES: usize = 1_000_000;
+
+/// Count the values in a YAML document, aliases expanded, without building
+/// it, and refuse it once the count passes [`MAX_YAML_NODES`].
+fn check_yaml_size(text: &str) -> Result<(), String> {
+    let count = Cell::new(0);
+    NodeBudget(&count)
+        .deserialize(serde_yaml::Deserializer::from_str(text))
+        .map_err(|e| e.to_string())
+}
+
+struct NodeBudget<'a>(&'a Cell<usize>);
+
+impl NodeBudget<'_> {
+    fn take<E: de::Error>(&self) -> Result<(), E> {
+        let n = self.0.get() + 1;
+        if n > MAX_YAML_NODES {
+            return Err(E::custom(format!(
+                "document holds more than {MAX_YAML_NODES} values once its aliases are expanded"
+            )));
+        }
+        self.0.set(n);
+        Ok(())
+    }
+
+    fn child(&self) -> Self {
+        NodeBudget(self.0)
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for NodeBudget<'_> {
+    type Value = ();
+
+    fn deserialize<D: de::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for NodeBudget<'_> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("any YAML value")
+    }
+
+    fn visit_bool<E: de::Error>(self, _: bool) -> Result<(), E> {
+        self.take()
+    }
+
+    fn visit_i64<E: de::Error>(self, _: i64) -> Result<(), E> {
+        self.take()
+    }
+
+    fn visit_i128<E: de::Error>(self, _: i128) -> Result<(), E> {
+        self.take()
+    }
+
+    fn visit_u64<E: de::Error>(self, _: u64) -> Result<(), E> {
+        self.take()
+    }
+
+    fn visit_u128<E: de::Error>(self, _: u128) -> Result<(), E> {
+        self.take()
+    }
+
+    fn visit_f64<E: de::Error>(self, _: f64) -> Result<(), E> {
+        self.take()
+    }
+
+    fn visit_str<E: de::Error>(self, _: &str) -> Result<(), E> {
+        self.take()
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<(), E> {
+        self.take()
+    }
+
+    fn visit_none<E: de::Error>(self) -> Result<(), E> {
+        self.take()
+    }
+
+    fn visit_some<D: de::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        self.take()?;
+        self.child().deserialize(deserializer)
+    }
+
+    fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        self.take()?;
+        while seq.next_element_seed(self.child())?.is_some() {}
+        Ok(())
+    }
+
+    fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        self.take()?;
+        while map.next_key_seed(self.child())?.is_some() {
+            map.next_value_seed(self.child())?;
+        }
+        Ok(())
+    }
+
+    fn visit_enum<A: de::EnumAccess<'de>>(self, data: A) -> Result<(), A::Error> {
+        use serde::de::VariantAccess;
+        self.take()?;
+        let (IgnoredAny, variant) = data.variant()?;
+        variant.newtype_variant_seed(self.child())
+    }
+}
 
 /// YAML's `.nan` and `.inf` would quietly become `null` in JSON, which
 /// `push` then sends as a cleared field. Refuse them, as the TOML reader does.
@@ -496,6 +611,57 @@ mod tests {
         assert_eq!(
             ConfigFormat::Yaml.parse("t: 0.5").unwrap(),
             json!({"t": 0.5})
+        );
+    }
+
+    /// One anchored list of 5,000 scalars, one of 5,000 aliases to it and one
+    /// of 200 aliases to that: about 26 KB that expands to 5 billion values.
+    fn nested_alias_bomb() -> String {
+        let mut text = String::from("a: &a [");
+        text.push_str(&vec!["x"; 5_000].join(","));
+        text.push_str("]\nb: &b [");
+        text.push_str(&vec!["*a"; 5_000].join(","));
+        text.push_str("]\nc: [");
+        text.push_str(&vec!["*b"; 200].join(","));
+        text.push_str("]\n");
+        text
+    }
+
+    #[test]
+    fn yaml_alias_bomb_is_refused_before_expanding() {
+        let text = nested_alias_bomb();
+        assert!(text.len() < 30_000, "{}", text.len());
+        let started = std::time::Instant::now();
+        let err = ConfigFormat::Yaml.parse(&text).unwrap_err();
+        assert!(err.contains("aliases are expanded"), "{err}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn yaml_node_limit_counts_expanded_aliases() {
+        // 1,001 aliases to a 1,000-value list: about 1M values once expanded.
+        let mut text = String::from("a: &a [");
+        text.push_str(&vec!["1"; 999].join(","));
+        text.push_str("]\nb: [");
+        text.push_str(&vec!["*a"; 1_001].join(","));
+        text.push_str("]\n");
+        assert!(ConfigFormat::Yaml.parse(&text).is_err());
+    }
+
+    #[test]
+    fn yaml_with_a_few_aliases_still_parses() {
+        let text = "defaults: &d\n  stability: 0.5\n  voice_id: v1\ntts: *d\ntags: !t [a]\n";
+        assert_eq!(
+            ConfigFormat::Yaml.parse(text).unwrap(),
+            json!({
+                "defaults": {"stability": 0.5, "voice_id": "v1"},
+                "tts": {"stability": 0.5, "voice_id": "v1"},
+                "tags": ["a"]
+            })
         );
     }
 
