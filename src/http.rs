@@ -387,46 +387,34 @@ impl HttpConfig {
         // list, not that flag.
         //
         // Even for `Authorization`-based auth, where reqwest does strip, the
-        // request URL and body are still delivered to the new host. So refuse
-        // to cross a host boundary at all rather than trying to sanitize.
+        // request URL and body are still delivered to the new target. So refuse
+        // to cross an origin boundary (scheme, host or port) at all rather than
+        // trying to sanitize. An HTTPS -> HTTP downgrade is refused even when
+        // the operator opted out, since it puts the credential on the wire in
+        // clear text.
         //
         // Refusing is deliberately loud. Silently dropping the credential
         // would turn a redirect into a confusing 401 that looks like the
         // user's credentials are wrong.
         let allow_cross_host_key = scoped(prefix, "_ALLOW_CROSS_HOST_REDIRECTS");
-        if first_env_truthy([allow_cross_host_key.clone()]).is_none() {
-            let env_key = allow_cross_host_key.clone();
-            builder = builder.redirect(reqwest::redirect::Policy::custom(move |attempt| {
-                // `Policy::custom` replaces reqwest's built-in hop limit, so
-                // re-impose it here or a redirect loop runs forever.
-                if attempt.previous().len() >= MAX_REDIRECTS {
-                    return attempt
-                        .error(format!("too many redirects (limit {MAX_REDIRECTS})"));
-                }
-                // Render both origins before deciding: `Attempt::error`
-                // consumes `attempt`, so nothing may still borrow it.
-                let crossing = attempt
-                    .previous()
-                    .last()
-                    .map(|previous| {
-                        (
-                            crosses_host(previous, attempt.url()),
-                            origin_only(previous),
-                            origin_only(attempt.url()),
-                        )
-                    })
-                    .filter(|(is_crossing, _, _)| *is_crossing);
-                match crossing {
-                    Some((_, from, to)) => attempt.error(format!(
-                        "refusing to follow a redirect from {from} to {to}: it crosses a host \
-                         boundary, and a credential carried in a custom header would be resent \
-                         to the new host. If this redirect is expected, set {env_key}=1 to \
-                         allow it."
-                    )),
-                    None => attempt.follow(),
-                }
-            }));
-        }
+        let allow_cross_origin = first_env_truthy([allow_cross_host_key.clone()]).is_some();
+        let env_key = allow_cross_host_key;
+        builder = builder.redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            // `Policy::custom` replaces reqwest's built-in hop limit, so
+            // re-impose it here or a redirect loop runs forever.
+            if attempt.previous().len() >= MAX_REDIRECTS {
+                return attempt.error(format!("too many redirects (limit {MAX_REDIRECTS})"));
+            }
+            // Decide before acting: `Attempt::error` consumes `attempt`, so
+            // nothing may still borrow it.
+            let refusal = attempt.previous().last().and_then(|previous| {
+                redirect_refusal(previous, attempt.url(), allow_cross_origin, &env_key)
+            });
+            match refusal {
+                Some(reason) => attempt.error(reason),
+                None => attempt.follow(),
+            }
+        }));
 
         // --- Proxy override ---
         //
@@ -608,17 +596,65 @@ fn scoped(prefix: &str, suffix: &str) -> String {
 /// reqwest's own default, which `Policy::custom` replaces.
 const MAX_REDIRECTS: usize = 10;
 
-/// Whether following `next` leaves the host `previous` was served from.
+/// Whether following `next` leaves the origin `previous` was served from.
 ///
-/// Compares the host only, deliberately more permissive than reqwest's own
-/// cross-origin test (which also compares the effective port). A plain
-/// `http://api.example.com` → `https://api.example.com` upgrade, or a hop to a
-/// different port on the same host, stays within one operator's
-/// infrastructure; the threat this guards is a hop to a *different host*.
-/// reqwest still applies its stricter port-sensitive stripping to
-/// `Authorization` on top of this, so nothing is weakened by the looser rule.
-fn crosses_host(previous: &reqwest::Url, next: &reqwest::Url) -> bool {
-    previous.host_str() != next.host_str()
+/// Compares the full origin: scheme, host and effective port
+/// (`port_or_known_default`). A custom credential header (`xi-api-key`) is
+/// resent by reqwest on every hop it follows — its sensitive-header stripping
+/// covers `Authorization` and cookies only — so a hop to plain HTTP or to
+/// another port on the same host would hand the key to whoever is on the wire
+/// or listening on that port.
+///
+/// The one exception is an `http` -> `https` upgrade on the same host between
+/// the default ports (80 -> 443): the credential was already sent over the
+/// original connection, and the new target is the TLS endpoint of the same
+/// server.
+fn crosses_origin(previous: &reqwest::Url, next: &reqwest::Url) -> bool {
+    if previous.host_str() != next.host_str() {
+        return true;
+    }
+    let same_scheme = previous.scheme() == next.scheme();
+    let same_port = previous.port_or_known_default() == next.port_or_known_default();
+    if same_scheme && same_port {
+        return false;
+    }
+    let default_port_upgrade = previous.scheme() == "http"
+        && next.scheme() == "https"
+        && previous.port_or_known_default() == Some(80)
+        && next.port_or_known_default() == Some(443);
+    !default_port_upgrade
+}
+
+/// Whether following `next` drops from HTTPS to anything unencrypted.
+fn downgrades_from_https(previous: &reqwest::Url, next: &reqwest::Url) -> bool {
+    previous.scheme() == "https" && next.scheme() != "https"
+}
+
+/// Why the redirect from `previous` to `next` must not be followed, or `None`
+/// to follow it. A downgrade from HTTPS is refused even when `allow_cross_origin`
+/// is set; any other origin change is refused unless it is.
+fn redirect_refusal(
+    previous: &reqwest::Url,
+    next: &reqwest::Url,
+    allow_cross_origin: bool,
+    env_key: &str,
+) -> Option<String> {
+    let (from, to) = (origin_only(previous), origin_only(next));
+    if downgrades_from_https(previous, next) {
+        return Some(format!(
+            "refusing to follow a redirect from {from} to {to}: it downgrades from HTTPS to an \
+             unencrypted connection, which would send a credential carried in a request header \
+             in clear text. This is refused even when {env_key} is set."
+        ));
+    }
+    if allow_cross_origin || !crosses_origin(previous, next) {
+        return None;
+    }
+    Some(format!(
+        "refusing to follow a redirect from {from} to {to}: it crosses an origin boundary \
+         (scheme, host or port), and a credential carried in a custom header would be resent \
+         to the new target. If this redirect is expected, set {env_key}=1 to allow it."
+    ))
 }
 
 /// `scheme://host[:port]` with the path, query and fragment dropped. Redirect
@@ -664,7 +700,7 @@ pub(crate) fn redirect_refusal_error(error: &reqwest::Error) -> Option<CliError>
     Some(CliError::Validation(message))
 }
 
-/// Refuse a pagination target that crosses a host boundary.
+/// Refuse a pagination target that crosses an origin boundary.
 ///
 /// The same trust boundary the redirect policy above guards, reached by a
 /// different route: `x-fern-pagination`'s `Uri` variant takes a
@@ -672,11 +708,12 @@ pub(crate) fn redirect_refusal_error(error: &reqwest::Error) -> Option<CliError>
 /// be absolute, so in both cases the *response* chooses where the next request
 /// goes. Following that to another host resends the credential — including a
 /// spec-declared custom header (`xi-api-key`, `X-API-Key`) that reqwest cannot
-/// know to strip — so the same rule applies: refuse to leave the host.
+/// know to strip — so the same rule applies: refuse to leave the origin.
 ///
-/// Host-only comparison, matching [`crosses_host`]: an `http` -> `https`
-/// upgrade or a port change stays within one operator's infrastructure. A
-/// `next` that is relative (or otherwise not an absolute URL) cannot redirect
+/// Full-origin comparison, matching [`crosses_origin`]: a change of scheme,
+/// host or effective port is refused, except an `http` -> `https` upgrade
+/// between default ports. A downgrade from HTTPS is refused even with the
+/// opt-out set. A `next` that is relative (or otherwise not an absolute URL) cannot redirect
 /// anywhere, so it is allowed without inspection.
 ///
 /// Opt out with `<PREFIX>_ALLOW_CROSS_HOST_PAGINATION`, deliberately separate
@@ -693,18 +730,27 @@ pub(crate) fn check_pagination_target(
     };
     let base = reqwest::Url::parse(base_url)
         .map_err(|e| format!("base URL `{base_url}` is not a valid URL: {e}"))?;
-    if !crosses_host(&base, &next) {
-        return Ok(());
-    }
     let prefix = cli_name.to_uppercase().replace('-', "_");
     let allow_key = scoped(&prefix, "_ALLOW_CROSS_HOST_PAGINATION");
+    if downgrades_from_https(&base, &next) {
+        return Err(format!(
+            "refusing to follow a pagination link from {} to {}: it downgrades from HTTPS to an \
+             unencrypted connection, which would send a credential carried in a request header \
+             in clear text. This is refused even when {allow_key} is set.",
+            origin_only(&base),
+            origin_only(&next),
+        ));
+    }
+    if !crosses_origin(&base, &next) {
+        return Ok(());
+    }
     if first_env_truthy([allow_key.clone()]).is_some() {
         return Ok(());
     }
     Err(format!(
-        "refusing to follow a pagination link from {} to {}: it crosses a host boundary, and a \
-         credential carried in a custom header would be sent to the new host. If this is \
-         expected, set {allow_key}=1 to allow it.",
+        "refusing to follow a pagination link from {} to {}: it crosses an origin boundary \
+         (scheme, host or port), and a credential carried in a custom header would be sent to \
+         the new target. If this is expected, set {allow_key}=1 to allow it.",
         origin_only(&base),
         origin_only(&next),
     ))
@@ -1705,25 +1751,75 @@ Wf86aX6PepsntZv2GYlA5UpabfT2EZICICpJ5h/iI+i341gBmLiAFQOyTDT+/wQc\n\
     }
 
     #[test]
-    fn crosses_host_compares_host_only() {
+    fn crosses_origin_compares_scheme_host_and_effective_port() {
         let parse = |s: &str| reqwest::Url::parse(s).expect("valid url");
+        let crosses = |a: &str, b: &str| crosses_origin(&parse(a), &parse(b));
         // A different host is a crossing, whatever the scheme.
-        assert!(crosses_host(
-            &parse("https://api.example.com/v1"),
-            &parse("https://evil.example.net/v1")
+        assert!(crosses(
+            "https://api.example.com/v1",
+            "https://evil.example.net/v1"
         ));
-        // A scheme upgrade on the same host is not — reqwest's own
-        // port-sensitive rule would call this cross-origin and strip
-        // `Authorization`, which is fine; we just don't refuse the hop.
-        assert!(!crosses_host(
-            &parse("http://api.example.com/v1"),
-            &parse("https://api.example.com/v1")
+        // Same origin, different path: not a crossing. An explicit default
+        // port is the same origin as an implied one.
+        assert!(!crosses(
+            "https://api.example.com/v1",
+            "https://api.example.com/v2?x=1"
         ));
-        // Same host, different port: same operator, not the modelled threat.
-        assert!(!crosses_host(
-            &parse("https://api.example.com/v1"),
-            &parse("https://api.example.com:8443/v1")
+        assert!(!crosses(
+            "https://api.example.com/v1",
+            "https://api.example.com:443/v1"
         ));
+        // Downgrade to plain HTTP on the same host: a crossing.
+        assert!(crosses(
+            "https://api.example.com/v1",
+            "http://api.example.com/v1"
+        ));
+        // Same host, different port: a crossing, in either scheme.
+        assert!(crosses(
+            "https://api.example.com/v1",
+            "https://api.example.com:8443/v1"
+        ));
+        assert!(crosses(
+            "http://127.0.0.1:8080/v1",
+            "http://127.0.0.1:9090/v1"
+        ));
+        // The one allowed scheme change: http -> https between default ports.
+        assert!(!crosses(
+            "http://api.example.com/v1",
+            "https://api.example.com/v1"
+        ));
+        // ...but not an upgrade that also moves to a non-default port.
+        assert!(crosses(
+            "http://api.example.com/v1",
+            "https://api.example.com:8443/v1"
+        ));
+        assert!(crosses(
+            "http://api.example.com:8080/v1",
+            "https://api.example.com/v1"
+        ));
+    }
+
+    #[test]
+    fn redirect_refusal_refuses_https_downgrade_even_when_opted_out() {
+        let parse = |s: &str| reqwest::Url::parse(s).expect("valid url");
+        let from = parse("https://api.elevenlabs.io/v1/voices");
+        let to = parse("http://api.elevenlabs.io/v1/voices/");
+        for allow in [false, true] {
+            let reason = redirect_refusal(&from, &to, allow, "X_ALLOW_CROSS_HOST_REDIRECTS")
+                .expect("an HTTPS -> HTTP downgrade must be refused");
+            assert!(reason.contains("downgrades from HTTPS"), "got: {reason}");
+            assert!(
+                !reason.contains("=1 to allow it"),
+                "a downgrade has no opt-out, so none should be offered, got: {reason}"
+            );
+        }
+        // The opt-out still unlocks other origin changes.
+        let other_port = parse("https://api.elevenlabs.io:8443/v1/voices");
+        assert!(redirect_refusal(&from, &other_port, false, "K").is_some());
+        assert!(redirect_refusal(&from, &other_port, true, "K").is_none());
+        // Same origin is always followed.
+        let same = parse("https://api.elevenlabs.io/v1/voices/");
+        assert!(redirect_refusal(&from, &same, false, "K").is_none());
     }
 
     #[test]
@@ -1787,7 +1883,7 @@ Wf86aX6PepsntZv2GYlA5UpabfT2EZICICpJ5h/iI+i341gBmLiAFQOyTDT+/wQc\n\
 
         let rendered = format!("{error:?}");
         assert!(
-            rendered.contains("crosses a host boundary"),
+            rendered.contains("crosses an origin boundary"),
             "the error should explain the refusal, got: {rendered}"
         );
         assert!(
@@ -1802,6 +1898,88 @@ Wf86aX6PepsntZv2GYlA5UpabfT2EZICICpJ5h/iI+i341gBmLiAFQOyTDT+/wQc\n\
                 .is_empty(),
             "the credential-bearing request must never reach the redirect target"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn same_host_redirect_to_another_port_is_refused_before_the_credential_is_resent() {
+        // Same host string (`127.0.0.1`), different port: reqwest itself keeps
+        // `xi-api-key` on this hop, so only the origin check stops it.
+        let mut env = EnvGuard::default();
+        env.unset("REDIRECTPORT_ALLOW_CROSS_HOST_REDIRECTS");
+
+        let target =
+            always_respond(wiremock::ResponseTemplate::new(200).set_body_string("{}")).await;
+        let target_url = format!("http://127.0.0.1:{}/v1/voices", target.address().port());
+        let api = always_respond(
+            wiremock::ResponseTemplate::new(307).insert_header("location", target_url.as_str()),
+        )
+        .await;
+        assert_eq!(
+            api.address().ip(),
+            target.address().ip(),
+            "same host, only the port differs"
+        );
+
+        let client = HttpConfig::new("redirectport")
+            .expect("config")
+            .build_client()
+            .expect("client");
+        let error = client
+            .get(format!("{}/v1/voices", api.uri()))
+            .header("xi-api-key", "super-secret")
+            .send()
+            .await
+            .expect_err("a redirect to another port must not be followed");
+
+        let rendered = format!("{error:?}");
+        assert!(
+            rendered.contains("crosses an origin boundary"),
+            "got: {rendered}"
+        );
+        assert!(
+            rendered.contains("REDIRECTPORT_ALLOW_CROSS_HOST_REDIRECTS"),
+            "got: {rendered}"
+        );
+        assert!(
+            target
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+            "the credential-bearing request must never reach the other port"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn same_origin_redirect_is_still_followed() {
+        let mut env = EnvGuard::default();
+        env.unset("REDIRECTSAME_ALLOW_CROSS_HOST_REDIRECTS");
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/v1/voices"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(307).insert_header("location", "/v1/voices/"),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::path("/v1/voices/"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+
+        let client = HttpConfig::new("redirectsame")
+            .expect("config")
+            .build_client()
+            .expect("client");
+        let response = client
+            .get(format!("{}/v1/voices", server.uri()))
+            .header("xi-api-key", "super-secret")
+            .send()
+            .await
+            .expect("a same-origin redirect should be followed");
+        assert_eq!(response.status(), 200);
     }
 
     #[test]
@@ -1839,7 +2017,7 @@ Wf86aX6PepsntZv2GYlA5UpabfT2EZICICpJ5h/iI+i341gBmLiAFQOyTDT+/wQc\n\
             match classified {
                 CliError::Validation(message) => {
                     assert!(
-                        message.contains("crosses a host boundary"),
+                        message.contains("crosses an origin boundary"),
                         "the policy reason must survive the source-chain walk, got: {message}"
                     );
                     assert!(
@@ -1890,16 +2068,52 @@ Wf86aX6PepsntZv2GYlA5UpabfT2EZICICpJ5h/iI+i341gBmLiAFQOyTDT+/wQc\n\
             "https://api.example.com/v1/things?cursor=2"
         )
         .is_ok());
-        // Scheme upgrade and port change stay within one operator's infra —
-        // same rule as `crosses_host` applies to redirects.
+        // An http -> https upgrade between default ports is the one allowed
+        // scheme change — same rule as `crosses_origin` applies to redirects.
         assert!(check_pagination_target(
             "pagesamehost",
             "http://api.example.com/v1/things",
             "https://api.example.com/v1/things?cursor=2"
         )
         .is_ok());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn pagination_target_on_another_port_or_scheme_is_refused() {
+        let mut env = EnvGuard::default();
+        env.unset("PAGEORIGIN_ALLOW_CROSS_HOST_PAGINATION");
+
+        for next in [
+            "https://api.example.com:8443/v1/things?cursor=2",
+            "http://api.example.com/v1/things?cursor=2",
+        ] {
+            let err =
+                check_pagination_target("pageorigin", "https://api.example.com/v1/things", next)
+                    .expect_err("a same-host link to another port or scheme must be refused");
+            assert!(
+                !err.contains("cursor=2"),
+                "must not echo the query, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn https_downgrade_pagination_target_is_refused_even_when_opted_out() {
+        let mut env = EnvGuard::default();
+        env.set("PAGEDOWNGRADE_ALLOW_CROSS_HOST_PAGINATION", "1");
+
+        let err = check_pagination_target(
+            "pagedowngrade",
+            "https://api.example.com/v1/things",
+            "http://api.example.com/v1/things?cursor=2",
+        )
+        .expect_err("an HTTPS -> HTTP pagination link must be refused despite the opt-out");
+        assert!(err.contains("downgrades from HTTPS"), "got: {err}");
+        // The opt-out still unlocks a port change.
         assert!(check_pagination_target(
-            "pagesamehost",
+            "pagedowngrade",
             "https://api.example.com/v1/things",
             "https://api.example.com:8443/v1/things?cursor=2"
         )
