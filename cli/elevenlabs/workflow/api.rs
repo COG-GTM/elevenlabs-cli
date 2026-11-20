@@ -258,6 +258,30 @@ fn build_agent_body(config: &Value, version_description: Option<&str>) -> Value 
     Value::Object(body)
 }
 
+// ── Path ids ───────────────────────────────────────────────────────
+
+/// Check an id before it is placed in a request path.
+///
+/// Ids reach these helpers from `agents.json` / `tools.json` / `tests.json`
+/// (committed and cloned, so untrusted), from argv, and from API responses.
+/// Interpolated as-is, `/`, `?`, `#` and dot segments (including `%2e%2e`,
+/// which the URL parser also collapses) let the id choose a different
+/// endpoint for an authenticated request. ElevenLabs ids are opaque
+/// `[A-Za-z0-9_-]` tokens, so anything else is rejected before any request.
+pub fn path_id<'a>(kind: &str, id: &'a str) -> Result<&'a str, CliError> {
+    let valid = !id.is_empty()
+        && id.len() <= 256
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    if valid {
+        return Ok(id);
+    }
+    Err(CliError::Validation(format!(
+        "Invalid {kind} id {id:?}: ids may only contain letters, digits, '_' and '-'"
+    )))
+}
+
 // ── Agent API ───────────────────────────────────────────────────────
 
 /// Result of an agent update — mirrors the fields v0 threads back into
@@ -301,7 +325,7 @@ pub fn update_agent(
     let resp = raw_request(
         ctx,
         Method::PATCH,
-        &format!("v1/convai/agents/{agent_id}"),
+        &format!("v1/convai/agents/{}", path_id("agent", agent_id)?),
         Some(body),
         query,
     )?;
@@ -332,7 +356,7 @@ pub fn get_agent(
     raw_request(
         ctx,
         Method::GET,
-        &format!("v1/convai/agents/{agent_id}"),
+        &format!("v1/convai/agents/{}", path_id("agent", agent_id)?),
         None,
         query,
     )
@@ -368,6 +392,7 @@ pub fn list_agents(ctx: &AppContext, search: Option<&str>) -> Result<Vec<Value>,
 
 /// Delete an agent. Uses the typed SDK method (empty response body).
 pub fn delete_agent(ctx: &AppContext, agent_id: &str) -> Result<(), CliError> {
+    let agent_id = path_id("agent", agent_id)?;
     let client = crate::sdk::client(ctx);
     crate::sdk::block_on(client.agents.delete(
         agent_id,
@@ -386,7 +411,7 @@ pub fn list_branches(
     let resp = raw_request(
         ctx,
         Method::GET,
-        &format!("v1/convai/agents/{agent_id}/branches"),
+        &format!("v1/convai/agents/{}/branches", path_id("agent", agent_id)?),
         None,
         Some(query),
     )?;
@@ -441,7 +466,7 @@ pub fn update_tool(ctx: &AppContext, tool_id: &str, config: &Value) -> Result<Va
     raw_request(
         ctx,
         Method::PATCH,
-        &format!("v1/convai/tools/{tool_id}"),
+        &format!("v1/convai/tools/{}", path_id("tool", tool_id)?),
         Some(json!({ "tool_config": config })),
         None,
     )
@@ -452,7 +477,7 @@ pub fn get_tool(ctx: &AppContext, tool_id: &str) -> Result<Value, CliError> {
     raw_request(
         ctx,
         Method::GET,
-        &format!("v1/convai/tools/{tool_id}"),
+        &format!("v1/convai/tools/{}", path_id("tool", tool_id)?),
         None,
         None,
     )
@@ -473,7 +498,7 @@ pub fn delete_tool(ctx: &AppContext, tool_id: &str) -> Result<(), CliError> {
     raw_request(
         ctx,
         Method::DELETE,
-        &format!("v1/convai/tools/{tool_id}"),
+        &format!("v1/convai/tools/{}", path_id("tool", tool_id)?),
         None,
         None,
     )?;
@@ -498,7 +523,7 @@ pub fn update_test(ctx: &AppContext, test_id: &str, config: &Value) -> Result<Va
     raw_request(
         ctx,
         Method::PUT,
-        &format!("v1/convai/agent-testing/{test_id}"),
+        &format!("v1/convai/agent-testing/{}", path_id("test", test_id)?),
         Some(config.clone()),
         None,
     )
@@ -509,7 +534,7 @@ pub fn get_test(ctx: &AppContext, test_id: &str) -> Result<Value, CliError> {
     raw_request(
         ctx,
         Method::GET,
-        &format!("v1/convai/agent-testing/{test_id}"),
+        &format!("v1/convai/agent-testing/{}", path_id("test", test_id)?),
         None,
         None,
     )
@@ -551,7 +576,7 @@ pub fn delete_test(ctx: &AppContext, test_id: &str) -> Result<(), CliError> {
     raw_request(
         ctx,
         Method::DELETE,
-        &format!("v1/convai/agent-testing/{test_id}"),
+        &format!("v1/convai/agent-testing/{}", path_id("test", test_id)?),
         None,
         None,
     )?;
@@ -576,7 +601,7 @@ pub fn run_tests_on_agent(
     raw_request(
         ctx,
         Method::POST,
-        &format!("v1/convai/agents/{agent_id}/run-tests"),
+        &format!("v1/convai/agents/{}/run-tests", path_id("agent", agent_id)?),
         Some(Value::Object(body)),
         None,
     )
@@ -587,7 +612,10 @@ pub fn get_test_invocation(ctx: &AppContext, invocation_id: &str) -> Result<Valu
     raw_request(
         ctx,
         Method::GET,
-        &format!("v1/convai/test-invocations/{invocation_id}"),
+        &format!(
+            "v1/convai/test-invocations/{}",
+            path_id("test invocation", invocation_id)?
+        ),
         None,
         None,
     )
@@ -784,5 +812,54 @@ mod tests {
     #[test]
     fn page_cap_is_bounded() {
         assert!(MAX_PAGES > 0 && MAX_PAGES <= 1000);
+    }
+
+    #[test]
+    fn path_id_accepts_real_ids() {
+        for id in [
+            "agent_8701k2abc",
+            "tool_1",
+            "test-1",
+            "J3PbhDQB2Lp7",
+            "agtbrch_main",
+        ] {
+            assert_eq!(path_id("agent", id).unwrap(), id);
+        }
+    }
+
+    #[test]
+    fn path_id_rejects_anything_that_could_change_the_endpoint() {
+        let long = "a".repeat(257);
+        for id in [
+            "",
+            ".",
+            "..",
+            "../x",
+            "../agents/agent_prod",
+            "%2e%2e/x",
+            "%2e%2e",
+            "a/b",
+            "a\\b",
+            "a?b=c",
+            "a#b",
+            "a b",
+            "a%20b",
+            "a\nb",
+            "a\u{202e}b",
+            "agent.1",
+            long.as_str(),
+        ] {
+            let err = path_id("test", id).expect_err(id);
+            assert!(matches!(err, CliError::Validation(_)), "{id:?}: {err:?}");
+        }
+    }
+
+    #[test]
+    fn path_id_error_escapes_the_id() {
+        let CliError::Validation(msg) = path_id("tool", "x\u{1b}[2Jy").unwrap_err() else {
+            panic!("expected a validation error");
+        };
+        assert!(msg.contains("tool id"), "{msg}");
+        assert!(!msg.contains('\u{1b}'), "{msg}");
     }
 }
