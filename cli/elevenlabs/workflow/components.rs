@@ -67,15 +67,19 @@ fn handle_add(args: AddArgs, _ctx: &AppContext) -> Result<(), CliError> {
 
     let (program, argv) = shadcn_argv(&url);
     // stdio is inherited so shadcn's interactive prompts work.
-    let status = Command::new(program).args(&argv).status().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            CliError::Validation(
-                "npx is not available. Please install Node.js/npm to add components.".to_string(),
-            )
-        } else {
-            CliError::Other(anyhow::anyhow!("Could not run npx: {e}"))
-        }
-    })?;
+    let status = fern_cli_sdk::without_dotenv_vars(&mut Command::new(program))
+        .args(&argv)
+        .status()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                CliError::Validation(
+                    "npx is not available. Please install Node.js/npm to add components."
+                        .to_string(),
+                )
+            } else {
+                CliError::Other(anyhow::anyhow!("Could not run npx: {e}"))
+            }
+        })?;
 
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
