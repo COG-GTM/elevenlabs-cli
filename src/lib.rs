@@ -79,7 +79,8 @@ pub fn reset_sigpipe() {
 pub fn reset_sigpipe() {}
 
 /// Unscoped env vars a `.env` file may not set, because each one redirects
-/// traffic, weakens transport security, or names a program to execute.
+/// traffic, weakens transport security, names a program to execute, or moves
+/// the config directory the CLI reads profiles and credentials from.
 /// Matched ignoring case (see [`dotenv_key_is_denied`]).
 const DOTENV_DENIED_BARE: &[&str] = &[
     // Names a program the CLI executes when paging output.
@@ -96,6 +97,21 @@ const DOTENV_DENIED_BARE: &[&str] = &[
     "SSL_CERT_DIR",
     "CURL_CA_BUNDLE",
     "REQUESTS_CA_BUNDLE",
+    // Decide where `profiles.toml` and the file credential store are read
+    // from. A planted profile can set `base_url`, `transport.proxy`,
+    // `transport.insecure` and `transport.ca_bundle`, and an active profile
+    // outranks env vars — so moving the config directory would restore every
+    // setting above.
+    "HOME",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+    "APPDATA",
+    "LOCALAPPDATA",
 ];
 
 /// Suffixes of `<PREFIX>_…` env vars a `.env` file may not set. Same
@@ -176,8 +192,8 @@ pub fn warn_ignored_dotenv_keys(ignored: &[String]) {
     for key in ignored {
         tracing::warn!(
             key = %key,
-            "ignoring {key} from .env: it controls transport or process execution, and a \
-             .env file is not a trusted source for it. Export it from your shell instead."
+            "ignoring {key} from .env: it controls transport, process execution, or where \
+             configuration is read from, and a .env file is not a trusted source for it. Export it from your shell instead."
         );
     }
 }
@@ -230,6 +246,19 @@ mod dotenv_filter_tests {
             "SSL_CERT_DIR",
             "CURL_CA_BUNDLE",
             "REQUESTS_CA_BUNDLE",
+            // Each moves the directory `profiles.toml` is read from.
+            "HOME",
+            "USERPROFILE",
+            "HOMEDRIVE",
+            "HOMEPATH",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "XDG_CACHE_HOME",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "xdg_config_home",
+            "AppData",
             // The HTTP stack reads the lowercase names too, and Windows any case.
             "http_proxy",
             "https_proxy",
