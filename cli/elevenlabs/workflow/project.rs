@@ -508,9 +508,26 @@ pub fn save_tests(config: &TestsConfig) -> Result<(), CliError> {
 /// normalized to forward slashes so index files stay portable across
 /// platforms. Returns empty when the directory doesn't exist. Ports v0's
 /// `discoverJsonFiles`.
+///
+/// The directory itself must lie inside the project and must not be a
+/// symlink; otherwise a repo could point discovery at files elsewhere on disk.
 pub fn discover_json_files(dir: &str) -> Vec<String> {
     let root = Path::new(dir);
-    if !root.exists() {
+    let Ok(meta) = std::fs::symlink_metadata(root) else {
+        return Vec::new();
+    };
+    if meta.file_type().is_symlink() {
+        eprintln!(
+            "Warning: Refusing to discover configs through the symlink at {}",
+            root.display()
+        );
+        return Vec::new();
+    }
+    if !meta.is_dir() {
+        return Vec::new();
+    }
+    if let Err(e) = resolve_in_project(dir) {
+        eprintln!("Warning: {e}");
         return Vec::new();
     }
     let mut found = Vec::new();
@@ -696,6 +713,41 @@ mod tests {
                 "only the real file should be discovered: {found:?}"
             );
             assert!(found[0].ends_with("real.json"));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_refuses_a_symlinked_root() {
+        in_temp_project(|_root| {
+            let outside = tempfile::tempdir().expect("outside");
+            std::fs::write(outside.path().join("private.json"), "{}").expect("write");
+            std::os::unix::fs::symlink(outside.path(), "test_configs").expect("symlink");
+
+            let found = discover_json_files("test_configs");
+            assert!(found.is_empty(), "nothing outside the project: {found:?}");
+
+            // A real parent directory doesn't launder the symlinked root.
+            std::fs::create_dir_all("nested").expect("mkdir");
+            std::os::unix::fs::symlink(outside.path(), "nested/test_configs").expect("symlink");
+            assert!(discover_json_files("nested/test_configs").is_empty());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_refuses_roots_outside_the_project() {
+        in_temp_project(|_root| {
+            let outside = tempfile::tempdir().expect("outside");
+            std::fs::write(outside.path().join("private.json"), "{}").expect("write");
+            let outside_str = outside.path().to_str().expect("utf8");
+            assert!(discover_json_files(outside_str).is_empty());
+
+            // A symlinked ancestor redirecting the root out of the project.
+            std::os::unix::fs::symlink(outside.path(), "linked").expect("symlink");
+            std::fs::create_dir_all(outside.path().join("test_configs")).expect("mkdir");
+            std::fs::write(outside.path().join("test_configs/private.json"), "{}").expect("write");
+            assert!(discover_json_files("linked/test_configs").is_empty());
         });
     }
 
