@@ -31,6 +31,7 @@ use super::mermaid::{
     EDGE_LABEL_MAX, NODE_LABEL_MAX, SHORT_ID_MIN,
 };
 use super::tool_diagram::tool_names_by_id;
+use super::util::printable;
 use super::{api, project};
 
 /// Tool ID → name, from tools.json: tool nodes are labelled by name where
@@ -97,7 +98,11 @@ fn diagram_all(format: Format) -> Result<(), CliError> {
         }
         match format {
             Format::Ascii => {
-                println!("── {} ({})\n", workflow.title, workflow.config_path);
+                println!(
+                    "── {} ({})\n",
+                    printable(&workflow.title),
+                    printable(&workflow.config_path)
+                );
                 print!(
                     "{}",
                     render_terminal(&workflow.workflow, &names, color, width)?
@@ -107,11 +112,15 @@ fn diagram_all(format: Format) -> Result<(), CliError> {
                 // Several flowcharts in one stream are not one Mermaid
                 // document; the comment marks where each starts. mermaid-md
                 // is the form meant for this.
-                println!("%% {} ({})", workflow.title, workflow.config_path);
+                println!(
+                    "%% {} ({})",
+                    printable(&workflow.title),
+                    printable(&workflow.config_path)
+                );
                 print!("{}", render_mermaid_named(&workflow.workflow, &names));
             }
             Format::MermaidMd => {
-                println!("### {}\n", workflow.title);
+                println!("### {}\n", printable(&workflow.title));
                 print!(
                     "{}",
                     fence(&render_mermaid_named(&workflow.workflow, &names))
@@ -180,12 +189,16 @@ fn load_all() -> Result<Vec<LoadedWorkflow>, CliError> {
         let config = match project::read_value_in_project(&config_path) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("Skipping '{title}': {e}");
+                eprintln!("Skipping '{}': {e}", printable(&title));
                 continue;
             }
         };
         let Some(workflow) = workflow_of(&config).cloned() else {
-            eprintln!("Skipping '{title}': no workflow ({config_path})");
+            eprintln!(
+                "Skipping '{}': no workflow ({})",
+                printable(&title),
+                printable(&config_path)
+            );
             continue;
         };
         loaded.push(LoadedWorkflow {
@@ -683,7 +696,7 @@ fn sink_copies(
 
 /// Collapse whitespace onto one line.
 fn one_line(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    printable(&text.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
 /// `text` with every ID-like word longer than [`SHORT_ID_MIN`] cut to its
@@ -981,6 +994,29 @@ mod tests {
             "edges": { "e": { "source": "a", "target": "b", "forward_condition": { "type": "unconditional" }, "backward_condition": null } }
         }));
         assert!(!out.contains("-.->"), "{out}");
+    }
+
+    #[test]
+    fn control_characters_never_reach_the_output() {
+        let esc = "\u{1b}[2J\u{1b}]0;pwned\u{7}\u{9b}31m";
+        let workflow = json!({
+            "nodes": {
+                "a": { "type": "say", "label": format!("Greet{esc}") },
+                format!("b{esc}"): { "type": "end" },
+                "c": { "type": "say", "label": "C" }
+            },
+            "edges": {
+                "e1": { "source": "a", "target": format!("b{esc}"), "forward_condition": { "type": "llm", "condition": format!("done{esc} now") } },
+                "e2": { "source": "a", "target": "c", "forward_condition": { "type": "llm", "condition": "go" }, "backward_condition": { "type": "llm", "condition": format!("back{esc}") } },
+                "e3": { "source": "a", "target": "missing", "forward_condition": { "type": "llm", "label": format!("x{esc}") } }
+            }
+        });
+        let stray = |out: &str| out.chars().any(|c| c.is_control() && c != '\n');
+        let drawn = render_terminal(&workflow, &ToolNames::new(), false, None).expect("draws");
+        assert!(!stray(&drawn), "{drawn:?}");
+        assert!(drawn.contains("done\u{FFFD}[2J"), "{drawn}");
+        let source = render(workflow);
+        assert!(!stray(&source), "{source:?}");
     }
 
     #[test]

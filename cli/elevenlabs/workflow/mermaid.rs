@@ -129,8 +129,7 @@ pub(super) fn quote(text: &str) -> String {
             '>' => out.push_str("#gt;"),
             '|' => out.push_str("#124;"),
             '`' => out.push_str("#96;"),
-            '\n' | '\r' => out.push(' '),
-            c => out.push(c),
+            c => out.push(one_line_char(c)),
         }
     }
     out.push('"');
@@ -147,8 +146,7 @@ pub(super) fn plain(text: &str) -> String {
             '"' => '\'',
             '<' => '‹',
             '>' => '›',
-            '\n' | '\r' => ' ',
-            c => c,
+            c => one_line_char(c),
         })
         .collect()
 }
@@ -175,7 +173,17 @@ pub(super) fn wrap(text: &str, width: usize) -> Vec<String> {
 
 /// A node ID for a `%%` comment: one line, nothing else to escape.
 pub(super) fn comment_safe(id: &str) -> String {
-    id.replace(['\n', '\r'], " ")
+    id.chars().map(one_line_char).collect()
+}
+
+/// Whitespace control characters become a space, every other control
+/// character (ESC and the like, which would reach the terminal) `\u{FFFD}`.
+fn one_line_char(c: char) -> char {
+    match c {
+        '\n' | '\r' | '\t' => ' ',
+        c if c.is_control() => '\u{FFFD}',
+        c => c,
+    }
 }
 
 /// Mermaid-safe node IDs.
@@ -345,6 +353,18 @@ mod tests {
             node_line("n_a", "(", r#""a (b)""#, ")", Target::Export),
             "    n_a(\"a (b)\")\n"
         );
+    }
+
+    #[test]
+    fn label_helpers_drop_terminal_control_characters() {
+        let text = "a\u{1b}[2Jb\u{7}\u{9b}31m\tc\nd";
+        for out in [quote(text), plain(text), comment_safe(text)] {
+            assert!(!out.chars().any(char::is_control), "{out:?}");
+            assert!(
+                out.contains("a\u{FFFD}[2Jb\u{FFFD}\u{FFFD}31m c d"),
+                "{out:?}"
+            );
+        }
     }
 
     #[test]

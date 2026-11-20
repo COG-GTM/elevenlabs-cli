@@ -27,6 +27,7 @@ use super::mermaid::{
     terminal_width, text_width, truncate, use_color, wrap, Format, MermaidIds, NodeLabel, Target,
     EDGE_LABEL_MAX, NODE_LABEL_MAX, SHORT_ID_MIN, TERMINAL_WRAP,
 };
+use super::util::printable;
 use super::{api, project};
 
 /// Register `agents graph`.
@@ -64,7 +65,7 @@ fn handle_graph(args: GraphArgs, _ctx: &AppContext) -> Result<(), CliError> {
     for entry in entries {
         match project::read_value_in_project(&entry.config_path) {
             Ok(config) => agents.push(LoadedAgent { entry, config }),
-            Err(e) => eprintln!("Skipping '{}': {e}", entry.title),
+            Err(e) => eprintln!("Skipping '{}': {e}", printable(&entry.title)),
         }
     }
     if agents.is_empty() {
@@ -117,7 +118,11 @@ fn handle_graph(args: GraphArgs, _ctx: &AppContext) -> Result<(), CliError> {
                 if i > 0 {
                     println!();
                 }
-                println!("── {} ({})\n", agent.entry.title, agent.entry.config_path);
+                println!(
+                    "── {} ({})\n",
+                    printable(&agent.entry.title),
+                    printable(&agent.entry.config_path)
+                );
                 print!("{}", draw(&agent_key(&agent.entry))?);
             }
         }
@@ -603,7 +608,12 @@ fn uses(graph: &Graph, query: &str) -> Vec<String> {
         }
         let agent = &graph.nodes[from];
         for via in vias {
-            lines.push(format!("{}\t{}\t{via}", agent.id, agent.name));
+            lines.push(format!(
+                "{}\t{}\t{}",
+                printable(&agent.id),
+                printable(&agent.name),
+                printable(via)
+            ));
         }
     }
     lines
