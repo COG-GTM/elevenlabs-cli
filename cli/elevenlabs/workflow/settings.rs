@@ -24,8 +24,13 @@ pub const RESIDENCY_VALUES: &[&str] = &[
 
 pub const DEFAULT_RESIDENCY: &str = "global";
 
+/// `$HOME`, then `%USERPROFILE%` (Windows shells leave `HOME` unset). A
+/// project's `.env` cannot set either; see `DOTENV_DENIED_BARE`.
 fn config_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".elevenlabs"))
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|h| !h.is_empty()))
+        .map(|home| PathBuf::from(home).join(".elevenlabs"))
 }
 
 fn config_file() -> Option<PathBuf> {
