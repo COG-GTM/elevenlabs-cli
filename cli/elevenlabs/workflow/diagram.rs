@@ -26,9 +26,9 @@ use serde_json::Value;
 
 use super::agents::{config_entries, find_agent, require_agents, AgentConfigEntry};
 use super::mermaid::{
-    abbreviate, comment_safe, draw_text, fence, node_line, push_classes, quote, str_field, tangles,
-    terminal_width, text_width, truncate, use_color, Format, MermaidIds, NodeLabel, Style, Target,
-    EDGE_LABEL_MAX, NODE_LABEL_MAX, SHORT_ID_MIN,
+    abbreviate, comment_safe, draw_text, fence, markdown_inline, node_line, push_classes, quote,
+    str_field, tangles, terminal_safe, terminal_width, text_width, truncate, use_color, Format,
+    MermaidIds, NodeLabel, Style, Target, EDGE_LABEL_MAX, NODE_LABEL_MAX, SHORT_ID_MIN,
 };
 use super::tool_diagram::tool_names_by_id;
 use super::{api, project};
@@ -88,38 +88,58 @@ fn handle_diagram(args: DiagramArgs, _ctx: &AppContext) -> Result<(), CliError> 
 }
 
 fn diagram_all(format: Format) -> Result<(), CliError> {
-    let color = use_color();
-    let width = terminal_width();
-    let names = tool_names_by_id();
-    for (i, workflow) in load_all()?.iter().enumerate() {
+    let workflows = load_all()?;
+    let out = render_all(
+        &workflows,
+        format,
+        &tool_names_by_id(),
+        use_color(),
+        terminal_width(),
+    )?;
+    print!("{out}");
+    Ok(())
+}
+
+/// Every workflow in `workflows`, each under a heading naming its agent.
+/// Titles and paths come from project files, so each heading is cut to one
+/// line with control characters removed, and escaped for where it goes.
+fn render_all(
+    workflows: &[LoadedWorkflow],
+    format: Format,
+    names: &ToolNames,
+    color: bool,
+    width: Option<usize>,
+) -> Result<String, CliError> {
+    let mut out = String::new();
+    for (i, workflow) in workflows.iter().enumerate() {
         if i > 0 {
-            println!();
+            out.push('\n');
         }
+        let title = one_line(&terminal_safe(&workflow.title));
+        let path = one_line(&terminal_safe(&workflow.config_path));
         match format {
             Format::Ascii => {
-                println!("── {} ({})\n", workflow.title, workflow.config_path);
-                print!(
-                    "{}",
-                    render_terminal(&workflow.workflow, &names, color, width)?
-                );
+                out.push_str(&format!("── {title} ({path})\n\n"));
+                out.push_str(&render_terminal(&workflow.workflow, names, color, width)?);
             }
             Format::Mermaid => {
                 // Several flowcharts in one stream are not one Mermaid
                 // document; the comment marks where each starts. mermaid-md
                 // is the form meant for this.
-                println!("%% {} ({})", workflow.title, workflow.config_path);
-                print!("{}", render_mermaid_named(&workflow.workflow, &names));
+                out.push_str(&format!(
+                    "%% {} ({})\n",
+                    comment_safe(&title),
+                    comment_safe(&path)
+                ));
+                out.push_str(&render_mermaid_named(&workflow.workflow, names));
             }
             Format::MermaidMd => {
-                println!("### {}\n", workflow.title);
-                print!(
-                    "{}",
-                    fence(&render_mermaid_named(&workflow.workflow, &names))
-                );
+                out.push_str(&format!("### {}\n\n", markdown_inline(&title)));
+                out.push_str(&fence(&render_mermaid_named(&workflow.workflow, names)));
             }
         }
     }
-    Ok(())
+    Ok(out)
 }
 
 // ── Loading ─────────────────────────────────────────────────────────
@@ -180,12 +200,16 @@ fn load_all() -> Result<Vec<LoadedWorkflow>, CliError> {
         let config = match project::read_value_in_project(&config_path) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("Skipping '{title}': {e}");
+                eprintln!("Skipping '{}': {e}", terminal_safe(&title));
                 continue;
             }
         };
         let Some(workflow) = workflow_of(&config).cloned() else {
-            eprintln!("Skipping '{title}': no workflow ({config_path})");
+            eprintln!(
+                "Skipping '{}': no workflow ({})",
+                terminal_safe(&title),
+                terminal_safe(&config_path)
+            );
             continue;
         };
         loaded.push(LoadedWorkflow {
@@ -301,7 +325,7 @@ fn render_terminal(
     if !built.legend.is_empty() {
         out.push('\n');
         for line in &built.legend {
-            out.push_str(line);
+            out.push_str(&terminal_safe(line));
             out.push('\n');
         }
     }
@@ -555,7 +579,10 @@ fn build_named(workflow: &Value, target: Target, layout: &Layout, names: &ToolNa
                         node_label(link.to, node_type, node, names).text
                     },
                 );
-                let back_to = format!("back to '{}'", truncate(&back_to, NODE_LABEL_MAX));
+                let back_to = format!(
+                    "back to '{}'",
+                    truncate(&terminal_safe(&back_to), NODE_LABEL_MAX)
+                );
                 legend.push(match label {
                     Some(label) => format!("{n:>3}  {} ({back_to})", one_line(label)),
                     None => format!("{n:>3}  {}{}", back_to[..1].to_uppercase(), &back_to[1..]),
@@ -681,9 +708,13 @@ fn sink_copies(
     copies
 }
 
-/// Collapse whitespace onto one line.
+/// Collapse whitespace onto one line, dropping control and invisible
+/// characters.
 fn one_line(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    terminal_safe(text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// `text` with every ID-like word longer than [`SHORT_ID_MIN`] cut to its
@@ -1000,6 +1031,117 @@ mod tests {
             out.contains(r#"n_a -->|"x#124;y #quot;z#quot;"| n_b"#),
             "{out}"
         );
+    }
+
+    /// Control or invisible characters in `text`, other than line breaks.
+    fn unsafe_chars(text: &str) -> Vec<char> {
+        text.chars()
+            .filter(|&c| {
+                c != '\n'
+                    && (c.is_control()
+                        || matches!(c, '\u{200B}'..='\u{200D}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'))
+            })
+            .collect()
+    }
+
+    /// A workflow whose labels, conditions and IDs carry escape sequences,
+    /// bidi overrides and zero-width characters.
+    fn hostile_workflow() -> Value {
+        json!({
+            "nodes": {
+                "a": { "type": "start" },
+                "b": { "type": "say", "label": "evil\u{1b}[2J\u{1b}[Hname\u{202E}" },
+                "c": { "type": "end" }
+            },
+            "edges": {
+                "e1": { "source": "a", "target": "b", "forward_condition": { "type": "llm", "condition": "go\u{1b}]8;;https://x.example\u{7}on\u{200B}" } },
+                "e2": { "source": "b", "target": "c", "forward_condition": { "type": "unconditional" }, "backward_condition": { "type": "llm", "condition": "back\u{1b}[1A\u{1b}[2K" } },
+                "e3": { "source": "b", "target": "gone\u{1b}[31m", "forward_condition": { "type": "unconditional" } }
+            }
+        })
+    }
+
+    #[test]
+    fn labels_and_legend_lines_drop_control_characters() {
+        let workflow = hostile_workflow();
+        let export = render(workflow.clone());
+        assert!(unsafe_chars(&export).is_empty(), "{export:?}");
+        assert!(export.contains("evil[2J[Hname"), "{export}");
+        let built = terminal(workflow.clone());
+        assert!(unsafe_chars(&built.source).is_empty(), "{:?}", built.source);
+        for line in &built.legend {
+            assert!(unsafe_chars(line).is_empty(), "{line:?}");
+        }
+        assert!(
+            built
+                .legend
+                .iter()
+                .any(|l| l.contains("go]8;;https://x.exampleon")),
+            "{:?}",
+            built.legend
+        );
+        let drawn = render_terminal(&workflow, &ToolNames::new(), false, None).unwrap();
+        assert!(unsafe_chars(&drawn).is_empty(), "{drawn:?}");
+    }
+
+    fn loaded(title: &str, config_path: &str) -> LoadedWorkflow {
+        LoadedWorkflow {
+            title: title.to_string(),
+            config_path: config_path.to_string(),
+            workflow: hostile_workflow(),
+        }
+    }
+
+    #[test]
+    fn all_headings_are_one_line_and_cannot_inject_markdown_or_mermaid() {
+        let title = "Support\n### Approved by @maintainers \u{2705}\n![x](https://evil.example/p.png) [ok](https://evil.example)\r\n%% x\n    n_a --> n_fake\u{1b}[2K";
+        let workflows = [
+            loaded(title, "agent_configs/a.json"),
+            loaded("Other", "agent_configs/b\n%% fake.json"),
+        ];
+        let names = ToolNames::new();
+
+        let md = render_all(&workflows, Format::MermaidMd, &names, false, None).unwrap();
+        assert!(unsafe_chars(&md).is_empty(), "{md:?}");
+        let headings: Vec<&str> = md.lines().filter(|l| l.starts_with('#')).collect();
+        assert_eq!(headings.len(), 2, "{md}");
+        assert_eq!(
+            headings[0],
+            r"### Support \#\#\# Approved by @maintainers ✅ \!\[x\](https://evil.example/p.png) \[ok\](https://evil.example) %% x n\_a --\> n\_fake\[2K"
+        );
+        assert_eq!(headings[1], "### Other");
+        // Every line outside the fences is a heading or blank.
+        let mut in_fence = false;
+        for line in md.lines() {
+            if line.starts_with("```") {
+                in_fence = !in_fence;
+            } else if !in_fence {
+                assert!(
+                    line.is_empty() || line.starts_with("### "),
+                    "{line:?} in {md}"
+                );
+            }
+        }
+
+        let mmd = render_all(&workflows, Format::Mermaid, &names, false, None).unwrap();
+        assert!(unsafe_chars(&mmd).is_empty(), "{mmd:?}");
+        let comments: Vec<&str> = mmd.lines().filter(|l| l.starts_with("%%")).collect();
+        assert_eq!(comments.len(), 2, "{mmd}");
+        assert!(
+            comments[1].ends_with("(agent_configs/b %% fake.json)"),
+            "{mmd}"
+        );
+        assert!(!mmd.lines().any(|l| l.trim() == "n_a --> n_fake"), "{mmd}");
+        assert_eq!(mmd.matches("flowchart TD").count(), 2, "{mmd}");
+
+        let ascii = render_all(&workflows, Format::Ascii, &names, false, None).unwrap();
+        assert!(unsafe_chars(&ascii).is_empty(), "{ascii:?}");
+        assert_eq!(
+            ascii.lines().filter(|l| l.starts_with("── ")).count(),
+            2,
+            "{ascii}"
+        );
+        assert!(!ascii.lines().any(|l| l.starts_with("###")), "{ascii}");
     }
 
     #[test]
