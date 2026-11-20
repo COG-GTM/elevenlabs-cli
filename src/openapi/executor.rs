@@ -142,9 +142,51 @@ pub(crate) fn encode_file_bytes_for_text(
     }
 }
 
+/// Long name of the opt-in flag that enables `@file` expansion inside
+/// `--json` bodies and JSON-valued object/array flags.
+pub const EXPAND_FILE_REFS_FLAG: &str = "expand-file-refs";
+
+/// Largest file a nested JSON `@file` reference may inline.
+pub const MAX_JSON_FILE_REF_BYTES: u64 = 50 * 1024 * 1024;
+
+/// Whether the caller passed `--expand-file-refs`. Tolerates matches built
+/// without the flag registered (programmatic callers, unit tests).
+pub fn expand_file_refs_enabled(matched_args: &clap::ArgMatches) -> bool {
+    matched_args
+        .try_get_one::<bool>(EXPAND_FILE_REFS_FLAG)
+        .ok()
+        .flatten()
+        .copied()
+        .unwrap_or(false)
+}
+
+/// Parse a `--json` body and, only when `--expand-file-refs` was passed,
+/// resolve nested `@file` references. Without the flag the body is returned
+/// unchanged so untrusted text that starts with `@` is never read from disk.
+pub fn expand_body_json_file_refs(
+    body_json: Option<String>,
+    expand: bool,
+) -> Result<Option<String>, CliError> {
+    match body_json {
+        Some(b) if expand => {
+            let mut json_val: Value = serde_json::from_str(&b)
+                .map_err(|e| CliError::Validation(format!("Invalid --json body: {e}")))?;
+            resolve_file_refs(&mut json_val)?;
+            serde_json::to_string(&json_val)
+                .map(Some)
+                .map_err(|e| CliError::Validation(format!("Invalid --json body: {e}")))
+        }
+        other => Ok(other),
+    }
+}
+
 /// Walk a parsed JSON value and resolve `@filename` references found in
 /// string positions. Mirrors Stainless's CLI generator behavior for the
 /// object-shorthand body-flag path (e.g. `--profile '{"pic":"@abe.jpg"}'`).
+///
+/// Only reached when the operator opts in with `--expand-file-refs`. Each
+/// referenced path must resolve to a regular file inside the current working
+/// directory and be at most [`MAX_JSON_FILE_REF_BYTES`].
 ///
 /// Rewrites in place:
 /// - `"\\@literal"`         → `"@literal"` (escape — no file read)
@@ -155,15 +197,87 @@ pub(crate) fn encode_file_bytes_for_text(
 ///
 /// Errors include the file path and a JSON-Pointer-style path to the offending
 /// field for debuggability (e.g. `"/foo/bar/0/baz"`). FER-10436, FER-10532.
-pub(crate) fn resolve_file_refs(value: &mut Value) -> Result<(), CliError> {
-    resolve_file_refs_at_path(value, &mut String::new())
+pub fn resolve_file_refs(value: &mut Value) -> Result<(), CliError> {
+    let base = std::env::current_dir().map_err(|e| {
+        CliError::Validation(format!(
+            "Cannot resolve @file references: current directory is unavailable: {e}"
+        ))
+    })?;
+    resolve_file_refs_under(value, &base)
+}
+
+/// [`resolve_file_refs`] with an explicit base directory that every
+/// referenced file must stay inside.
+pub(crate) fn resolve_file_refs_under(
+    value: &mut Value,
+    base: &std::path::Path,
+) -> Result<(), CliError> {
+    let base = std::fs::canonicalize(base).map_err(|e| {
+        CliError::Validation(format!(
+            "Cannot resolve @file references: base directory '{}' is unavailable: {e}",
+            base.display()
+        ))
+    })?;
+    resolve_file_refs_at_path(value, &mut String::new(), &base)
+}
+
+/// Read a nested JSON `@file` reference after confirming the path stays under
+/// `base` (symlinks resolved), names a regular file, and fits the size cap.
+fn read_confined_file_ref(
+    path: &str,
+    base: &std::path::Path,
+    field: &str,
+) -> Result<Vec<u8>, CliError> {
+    use std::io::Read;
+    let read_err = |detail: String| {
+        CliError::Validation(format!(
+            "Failed to read file '{path}' for JSON field '{field}': {detail}"
+        ))
+    };
+    let candidate = std::path::Path::new(path);
+    let joined = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        base.join(candidate)
+    };
+    let canonical = std::fs::canonicalize(&joined).map_err(|e| read_err(e.to_string()))?;
+    if !canonical.starts_with(base) {
+        return Err(read_err(format!(
+            "path is outside the working directory '{}'",
+            base.display()
+        )));
+    }
+    let file = std::fs::File::open(&canonical).map_err(|e| read_err(e.to_string()))?;
+    let meta = file.metadata().map_err(|e| read_err(e.to_string()))?;
+    if !meta.is_file() {
+        return Err(read_err("not a regular file".to_string()));
+    }
+    if meta.len() > MAX_JSON_FILE_REF_BYTES {
+        return Err(read_err(format!(
+            "file is larger than the {MAX_JSON_FILE_REF_BYTES}-byte limit"
+        )));
+    }
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    file.take(MAX_JSON_FILE_REF_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| read_err(e.to_string()))?;
+    if bytes.len() as u64 > MAX_JSON_FILE_REF_BYTES {
+        return Err(read_err(format!(
+            "file is larger than the {MAX_JSON_FILE_REF_BYTES}-byte limit"
+        )));
+    }
+    Ok(bytes)
 }
 
 /// Recursive worker for [`resolve_file_refs`]. `pointer` is the current
 /// JSON-Pointer-style path (per RFC 6901, e.g. `""`, `"/foo"`, `"/foo/bar/0"`)
 /// to the value being inspected — extended in place as we descend and
 /// truncated on the way back up to avoid per-level allocations.
-fn resolve_file_refs_at_path(value: &mut Value, pointer: &mut String) -> Result<(), CliError> {
+fn resolve_file_refs_at_path(
+    value: &mut Value,
+    pointer: &mut String,
+    base: &std::path::Path,
+) -> Result<(), CliError> {
     match value {
         Value::String(s) => {
             match parse_at_ref(s) {
@@ -182,12 +296,7 @@ fn resolve_file_refs_at_path(value: &mut Value, pointer: &mut String) -> Result<
                         path.as_ref(),
                         &format!("JSON field '{field}'"),
                     )?;
-                    let bytes = std::fs::read(path.as_ref()).map_err(|io_err| {
-                        CliError::Validation(format!(
-                            "Failed to read file '{}' for JSON field '{field}': {io_err}",
-                            path.as_ref()
-                        ))
-                    })?;
+                    let bytes = read_confined_file_ref(path.as_ref(), base, field)?;
                     // Auto preserves the FER-10436 behavior (UTF-8 or base64);
                     // Text and Data are the FER-10532 explicit modes.
                     *s = encode_file_bytes_for_text(
@@ -205,7 +314,7 @@ fn resolve_file_refs_at_path(value: &mut Value, pointer: &mut String) -> Result<
                 let original_len = pointer.len();
                 pointer.push('/');
                 pointer.push_str(&i.to_string());
-                resolve_file_refs_at_path(item, pointer)?;
+                resolve_file_refs_at_path(item, pointer, base)?;
                 pointer.truncate(original_len);
             }
             Ok(())
@@ -222,7 +331,7 @@ fn resolve_file_refs_at_path(value: &mut Value, pointer: &mut String) -> Result<
                         other => pointer.push(other),
                     }
                 }
-                resolve_file_refs_at_path(v, pointer)?;
+                resolve_file_refs_at_path(v, pointer, base)?;
                 pointer.truncate(original_len);
             }
             Ok(())
@@ -876,21 +985,11 @@ fn parse_and_validate_inputs(
     // `body_from_flags` are never both populated (before global-param
     // injection), so the body is sourced from exactly one channel here.
     let body: Option<Value> = if let Some(b) = body_json {
-        let mut json_val: Value = serde_json::from_str(b)
+        // The body is used verbatim: `@file` expansion is opt-in via
+        // `--expand-file-refs` and happens in the dispatcher before this
+        // point, so a string that starts with `@` is never read from disk here.
+        let json_val: Value = serde_json::from_str(b)
             .map_err(|e| CliError::Validation(format!("Invalid --json body: {e}")))?;
-        // Resolve `@file` references inside `--json` bodies, matching the
-        // behavior of per-field object-shorthand flags (FER-10436).
-        //
-        // Called directly (no `block_in_place`) because this sync function
-        // is reached from two async contexts:
-        //   a) binding.rs dispatch → `execute_method().await`
-        //   b) app.rs custom-command → `block_in_place` → `block_on` →
-        //      `execute_method`
-        // Wrapping in `block_in_place` here would create a nested
-        // `block_in_place → block_on → block_in_place` chain in path (b).
-        // The file reads are brief, and for a CLI tool the momentary
-        // blocking of a single worker thread is acceptable.
-        resolve_file_refs(&mut json_val)?;
         Some(json_val)
     } else if !body_from_flags.is_empty() {
         Some(Value::Object(body_from_flags))
@@ -6205,7 +6304,7 @@ mod tests {
                 "untouched": "verbatim",
             }
         });
-        resolve_file_refs(&mut value).expect("should resolve");
+        resolve_file_refs_under(&mut value, tmp.path().parent().unwrap()).expect("should resolve");
         assert_eq!(value["outer"]["pic"], json!("hello from disk"));
         assert_eq!(value["outer"]["untouched"], json!("verbatim"));
     }
@@ -6220,7 +6319,7 @@ mod tests {
         let at_path = format!("@{}", tmp.path().to_str().unwrap());
 
         let mut value = json!({ "blob": at_path });
-        resolve_file_refs(&mut value).expect("should resolve");
+        resolve_file_refs_under(&mut value, tmp.path().parent().unwrap()).expect("should resolve");
         let expected = BASE64.encode(&raw_bytes);
         assert_eq!(value["blob"], json!(expected));
     }
@@ -6334,7 +6433,7 @@ mod tests {
         let at_path = format!("@file://{}", tmp.path().to_str().unwrap());
 
         let mut value = json!({ "outer": { "pic": at_path } });
-        resolve_file_refs(&mut value).expect("should resolve");
+        resolve_file_refs_under(&mut value, tmp.path().parent().unwrap()).expect("should resolve");
         assert_eq!(value["outer"]["pic"], json!("hello strict"));
     }
 
@@ -6348,7 +6447,8 @@ mod tests {
         let at_path = format!("@file://{}", tmp.path().to_str().unwrap());
 
         let mut value = json!({ "blob": at_path });
-        let err = resolve_file_refs(&mut value).expect_err("must reject non-UTF-8");
+        let err = resolve_file_refs_under(&mut value, tmp.path().parent().unwrap())
+            .expect_err("must reject non-UTF-8");
         let CliError::Validation(msg) = &err else {
             panic!("expected Validation, got {err:?}");
         };
@@ -6375,7 +6475,7 @@ mod tests {
         let at_path = format!("@data://{}", tmp.path().to_str().unwrap());
 
         let mut value = json!({ "encoded": at_path });
-        resolve_file_refs(&mut value).expect("should resolve");
+        resolve_file_refs_under(&mut value, tmp.path().parent().unwrap()).expect("should resolve");
         let expected = BASE64.encode(utf8_payload);
         assert_eq!(value["encoded"], json!(expected));
     }
@@ -6388,7 +6488,7 @@ mod tests {
         let at_path = format!("@data://{}", tmp.path().to_str().unwrap());
 
         let mut value = json!({ "blob": at_path });
-        resolve_file_refs(&mut value).expect("should resolve");
+        resolve_file_refs_under(&mut value, tmp.path().parent().unwrap()).expect("should resolve");
         assert_eq!(value["blob"], json!(BASE64.encode(&raw_bytes)));
     }
 
@@ -6406,6 +6506,151 @@ mod tests {
         let mut value = json!({ "k": "\\@data:///etc/hosts" });
         resolve_file_refs(&mut value).expect("escape should not touch disk");
         assert_eq!(value["k"], json!("@data:///etc/hosts"));
+    }
+
+    // -----------------------------------------------------------------
+    // Untrusted `@` values in `--json` bodies must not be read from disk
+    // unless the operator opts in with `--expand-file-refs`; when they do,
+    // reads are confined to regular files under the working directory.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_security_json_body_at_ref_is_not_read_by_default() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"SECRET-CONTENTS").unwrap();
+        let at_path = format!("@{}", tmp.path().to_str().unwrap());
+        let body = json!({
+            "text": at_path,
+            "nested": { "v": ["@/etc/hostname", "@data:///etc/hostname"] },
+            "escaped": "\\@literal",
+        })
+        .to_string();
+        let method = RestMethod {
+            http_method: "POST".to_string(),
+            path: "tts".to_string(),
+            ..Default::default()
+        };
+        let doc = RestDescription {
+            base_url: Some("https://api.example.com/".to_string()),
+            ..Default::default()
+        };
+        let input =
+            parse_and_validate_inputs(&doc, &method, None, Some(&body), false, None, &[], &[])
+                .expect("body should be accepted verbatim");
+        let sent = input.body.expect("body present");
+        assert_eq!(sent["text"], json!(at_path));
+        assert_eq!(sent["nested"]["v"][0], json!("@/etc/hostname"));
+        assert_eq!(sent["nested"]["v"][1], json!("@data:///etc/hostname"));
+        assert_eq!(sent["escaped"], json!("\\@literal"));
+        assert!(!sent.to_string().contains("SECRET-CONTENTS"));
+    }
+
+    #[test]
+    fn test_security_expand_body_json_is_noop_without_opt_in() {
+        let body = r#"{"text":"@/etc/hostname"}"#.to_string();
+        let out = expand_body_json_file_refs(Some(body.clone()), false).unwrap();
+        assert_eq!(out.as_deref(), Some(body.as_str()));
+        assert_eq!(expand_body_json_file_refs(None, true).unwrap(), None);
+    }
+
+    #[test]
+    fn test_security_expand_body_json_rejects_path_outside_cwd() {
+        // `/etc/hostname` is outside the crate directory cargo runs tests in.
+        let body = r#"{"text":"@/etc/hostname"}"#.to_string();
+        let err = expand_body_json_file_refs(Some(body), true).expect_err("must reject");
+        let CliError::Validation(msg) = &err else {
+            panic!("expected Validation, got {err:?}");
+        };
+        assert!(
+            msg.contains("outside the working directory") || msg.contains("No such file"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_security_file_ref_absolute_path_outside_base_is_rejected() {
+        let base = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), b"SECRET").unwrap();
+        let at_path = format!("@{}", outside.path().display());
+        let mut value = json!({ "text": at_path.clone() });
+        let err = resolve_file_refs_under(&mut value, base.path()).expect_err("must reject");
+        let CliError::Validation(msg) = &err else {
+            panic!("expected Validation, got {err:?}");
+        };
+        assert!(msg.contains("outside the working directory"), "got: {msg}");
+        assert!(
+            msg.contains("/text"),
+            "error must include JSON pointer: {msg}"
+        );
+        assert_eq!(value["text"], json!(at_path));
+    }
+
+    #[test]
+    fn test_security_file_ref_dot_dot_traversal_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("work");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::write(root.path().join("secret.txt"), b"SECRET").unwrap();
+        let mut value = json!({ "text": "@../secret.txt" });
+        let err = resolve_file_refs_under(&mut value, &base).expect_err("must reject");
+        let CliError::Validation(msg) = &err else {
+            panic!("expected Validation, got {err:?}");
+        };
+        assert!(msg.contains("outside the working directory"), "got: {msg}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_security_file_ref_symlink_escaping_base_is_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("work");
+        std::fs::create_dir(&base).unwrap();
+        let secret = root.path().join("secret.txt");
+        std::fs::write(&secret, b"SECRET").unwrap();
+        std::os::unix::fs::symlink(&secret, base.join("link.txt")).unwrap();
+        let mut value = json!({ "text": "@link.txt" });
+        let err = resolve_file_refs_under(&mut value, &base).expect_err("must reject");
+        let CliError::Validation(msg) = &err else {
+            panic!("expected Validation, got {err:?}");
+        };
+        assert!(msg.contains("outside the working directory"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_security_file_ref_directory_is_rejected() {
+        let base = tempfile::tempdir().unwrap();
+        std::fs::create_dir(base.path().join("dir")).unwrap();
+        let mut value = json!({ "text": "@dir" });
+        let err = resolve_file_refs_under(&mut value, base.path()).expect_err("must reject");
+        let CliError::Validation(msg) = &err else {
+            panic!("expected Validation, got {err:?}");
+        };
+        assert!(msg.contains("not a regular file"), "got: {msg}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_security_file_ref_device_file_is_rejected() {
+        // `/dev/zero` would otherwise be read until memory runs out.
+        let mut value = json!({ "text": "@/dev/zero" });
+        let err = resolve_file_refs_under(&mut value, std::path::Path::new("/dev"))
+            .expect_err("must reject");
+        let CliError::Validation(msg) = &err else {
+            panic!("expected Validation, got {err:?}");
+        };
+        assert!(msg.contains("not a regular file"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_security_file_ref_relative_path_inside_base_still_resolves() {
+        let base = tempfile::tempdir().unwrap();
+        std::fs::create_dir(base.path().join("sub")).unwrap();
+        std::fs::write(base.path().join("sub/a.txt"), b"hello").unwrap();
+        let mut value = json!({ "text": "@sub/a.txt", "esc": "\\@x" });
+        resolve_file_refs_under(&mut value, base.path()).expect("should resolve");
+        assert_eq!(value["text"], json!("hello"));
+        assert_eq!(value["esc"], json!("@x"));
     }
 
     #[test]

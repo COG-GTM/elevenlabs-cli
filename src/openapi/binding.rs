@@ -679,10 +679,10 @@ impl Binding for OpenApiBinding {
             let params_override = matched_args
                 .get_one::<String>("params")
                 .map(|s| s.as_str());
-            // `collect_params_from_flags` may call `resolve_file_refs` which
-            // performs blocking `std::fs::read` I/O. Wrap in `block_in_place`
-            // so the tokio runtime can schedule other work while the thread is
-            // parked on disk reads.
+            // `collect_params_from_flags` may call `resolve_file_refs` (only
+            // with `--expand-file-refs`), which performs blocking file I/O.
+            // Wrap in `block_in_place` so the tokio runtime can schedule other
+            // work while the thread is parked on disk reads.
             let mut params = tokio::task::block_in_place(|| {
                 super::app::collect_params_from_flags(
                     matched_args,
@@ -706,7 +706,13 @@ impl Binding for OpenApiBinding {
                 Some(&params_json_string)
             };
 
+            let expand_file_refs = executor::expand_file_refs_enabled(matched_args);
             let body_json_owned = crate::cli_args::resolve_body_json(matched_args)?;
+            // `@file` expansion inside `--json` is opt-in; blocking reads run
+            // under `block_in_place` like `collect_params_from_flags` above.
+            let body_json_owned = tokio::task::block_in_place(|| {
+                executor::expand_body_json_file_refs(body_json_owned, expand_file_refs)
+            })?;
             let body_json = body_json_owned.as_deref();
 
             let dry_run = matched_args.get_flag("dry-run");

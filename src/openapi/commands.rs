@@ -94,6 +94,7 @@ pub(crate) const BUILTIN_FLAG_NAMES: &[&str] = &[
     "json",
     "format",
     "dry-run",
+    "expand-file-refs",
     "base-url",
     "page-all",
     "page-limit",
@@ -207,6 +208,13 @@ pub fn build_cli(doc: &RestDescription) -> Command {
             clap::Arg::new("dry-run")
                 .long("dry-run")
                 .help("Validate the request locally without sending it to the API")
+                .action(clap::ArgAction::SetTrue)
+                .global(true),
+        )
+        .arg(
+            clap::Arg::new(crate::openapi::executor::EXPAND_FILE_REFS_FLAG)
+                .long(crate::openapi::executor::EXPAND_FILE_REFS_FLAG)
+                .help("Read files named by `@<path>` string values inside --json and JSON-valued flags (off by default; paths must be regular files under the current directory, max 50 MiB; `\\@` sends a literal `@`)")
                 .action(clap::ArgAction::SetTrue)
                 .global(true),
         )
@@ -699,7 +707,7 @@ fn build_resource_command(
             method_cmd = method_cmd.arg(
                 Arg::new("json")
                     .long("json")
-                    .help("JSON request body (use `-` to read from stdin; auto-detected, errors if no data piped)")
+                    .help("JSON request body (use `-` to read from stdin; auto-detected, errors if no data piped). Sent verbatim: `@<path>` values are only read from disk with --expand-file-refs")
                     .value_name("JSON|-")
                     .help_heading(HELP_HEADING_REQUEST),
             );
